@@ -8,6 +8,7 @@
 #include <sstream>
 #include <turbojpeg.h>
 #include <vector>
+#include <map>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -26,6 +27,353 @@
 #endif
 
 using namespace libcamera;
+
+// Shared buffer pool for memory mappings with LRU eviction
+class SharedBufferPool {
+private:
+    struct BufferMapping {
+        void* mapped_data = nullptr;
+        size_t size = 0;
+        uint64_t last_access_time = 0;  // For LRU eviction
+    };
+
+    std::map<int, BufferMapping> buffer_mappings_;  // fd -> mapping
+    static const size_t MAX_BUFFER_MAPPINGS = 12;   // Increased for shared usage
+    uint64_t access_counter_ = 0;  // Monotonic counter for LRU
+
+    // LRU eviction helper
+    void evictOldestMapping() {
+        if (buffer_mappings_.empty()) return;
+
+        auto oldest_it = buffer_mappings_.begin();
+        for (auto it = buffer_mappings_.begin(); it != buffer_mappings_.end(); ++it) {
+            if (it->second.last_access_time < oldest_it->second.last_access_time) {
+                oldest_it = it;
+            }
+        }
+
+        // Cleanup the mapping
+        if (oldest_it->second.mapped_data && oldest_it->second.mapped_data != MAP_FAILED) {
+            munmap(oldest_it->second.mapped_data, oldest_it->second.size);
+        }
+
+        std::cout << "SharedBufferPool: Evicted mapping for fd=" << oldest_it->first
+                  << " (LRU, access_time=" << oldest_it->second.last_access_time << ")" << std::endl;
+
+        buffer_mappings_.erase(oldest_it);
+    }
+
+public:
+    ~SharedBufferPool() {
+        // Cleanup all mappings
+        for (auto& pair : buffer_mappings_) {
+            if (pair.second.mapped_data && pair.second.mapped_data != MAP_FAILED) {
+                munmap(pair.second.mapped_data, pair.second.size);
+            }
+        }
+        buffer_mappings_.clear();
+    }
+
+    // Get or create mapping for file descriptor
+    void* getMapping(int dma_fd, size_t total_size, const std::string& client_name = "unknown") {
+        if (dma_fd < 0 || total_size == 0) {
+            return nullptr;
+        }
+
+        // Get or create mapping for this fd with LRU eviction
+        auto it = buffer_mappings_.find(dma_fd);
+        void* mapped_data = nullptr;
+
+        if (it == buffer_mappings_.end() || it->second.size != total_size) {
+            // Need to create new mapping
+            if (it != buffer_mappings_.end() && it->second.mapped_data) {
+                // Cleanup old mapping with different size
+                munmap(it->second.mapped_data, it->second.size);
+                buffer_mappings_.erase(it);
+            }
+
+            // Check if we need to evict oldest mapping before adding new one
+            if (buffer_mappings_.size() >= MAX_BUFFER_MAPPINGS) {
+                evictOldestMapping();
+            }
+
+            mapped_data = mmap(nullptr, total_size, PROT_READ, MAP_SHARED, dma_fd, 0);
+            if (mapped_data == MAP_FAILED) {
+                std::cerr << "SharedBufferPool: Failed to mmap for " << client_name
+                          << ", fd=" << dma_fd << ": " << strerror(errno) << std::endl;
+                return nullptr;
+            }
+
+            // Add new mapping with current access time
+            buffer_mappings_[dma_fd] = {mapped_data, total_size, ++access_counter_};
+            std::cout << "SharedBufferPool: New mapping for " << client_name
+                      << ", fd=" << dma_fd << ", size=" << total_size
+                      << " (total: " << buffer_mappings_.size() << ")" << std::endl;
+        } else {
+            // Use existing mapping and update access time
+            mapped_data = it->second.mapped_data;
+            it->second.last_access_time = ++access_counter_;
+        }
+
+        return mapped_data;
+    }
+
+    // Debug utility
+    void printStats() const {
+        std::cout << "SharedBufferPool: " << buffer_mappings_.size()
+                  << "/" << MAX_BUFFER_MAPPINGS << " mappings:" << std::endl;
+        for (const auto& pair : buffer_mappings_) {
+            std::cout << "  fd=" << pair.first
+                      << " size=" << pair.second.size
+                      << " access_time=" << pair.second.last_access_time << std::endl;
+        }
+    }
+};
+
+// Global shared buffer pool instance
+static SharedBufferPool g_buffer_pool;
+
+// Smart Streaming Policies
+enum class StreamingState {
+    STARTUP,        // Initial phase - always encode
+    MOTION_ACTIVE,  // Motion detected - active encoding
+    STABILIZING,    // Motion stopped - waiting for stabilization
+    STATIC_CACHED,  // Static scene - send cached frames
+    MOTION_RESUME   // Motion resumed - quick transition
+};
+
+struct SceneAnalysis {
+    bool motion_detected = false;
+    bool af_stable = false;
+    float motion_level = 0.0f;
+    std::chrono::milliseconds since_last_motion{0};
+    std::chrono::milliseconds since_af_stable{0};
+};
+
+// Always stream policy (current behavior)
+class AlwaysStreamPolicy {
+public:
+    bool shouldEncodeH264(const SceneAnalysis&) { return true; }
+    bool shouldEncodeMJPEG(const SceneAnalysis&) { return true; }
+    void onFrameEncoded(const std::vector<unsigned char>&, bool) {}
+    template<typename H264Handler, typename MJPEGHandler>
+    void sendCachedFrame(H264Handler&, MJPEGHandler&) {}
+};
+
+// Motion-triggered stream policy
+class MotionStreamPolicy {
+private:
+    bool motion_active_ = false;
+    std::chrono::steady_clock::time_point last_motion_time_;
+
+public:
+    bool shouldEncodeH264(const SceneAnalysis& scene) {
+        updateMotionState(scene);
+        return motion_active_;
+    }
+
+    bool shouldEncodeMJPEG(const SceneAnalysis& scene) {
+        updateMotionState(scene);
+        return motion_active_;
+    }
+
+    void onFrameEncoded(const std::vector<unsigned char>&, bool) {}
+    template<typename H264Handler, typename MJPEGHandler>
+    void sendCachedFrame(H264Handler&, MJPEGHandler&) {}
+
+private:
+    void updateMotionState(const SceneAnalysis& scene) {
+        if (scene.motion_detected) {
+            motion_active_ = true;
+            last_motion_time_ = std::chrono::steady_clock::now();
+        } else {
+            auto now = std::chrono::steady_clock::now();
+            auto time_since_motion = std::chrono::duration_cast<std::chrono::seconds>(now - last_motion_time_);
+            if (time_since_motion > std::chrono::seconds(3)) {
+                motion_active_ = false;
+            }
+        }
+    }
+};
+
+// Hybrid smart streaming policy
+class HybridStreamPolicy {
+private:
+    StreamingState current_state_ = StreamingState::STARTUP;
+    std::chrono::steady_clock::time_point startup_time_;
+    std::chrono::steady_clock::time_point stabilize_start_;
+    std::chrono::steady_clock::time_point cache_timestamp_;
+    std::chrono::steady_clock::time_point last_cache_send_;
+
+    // Cached frames
+    std::vector<unsigned char> cached_h264_frame_;
+    std::vector<unsigned char> cached_mjpeg_frame_;
+    bool has_cached_frames_ = false;
+
+    // Cache transmission throttling
+    std::chrono::milliseconds cache_send_interval_{1000}; // Send cached frame every 1 second instead of 30 FPS
+
+public:
+    HybridStreamPolicy() : startup_time_(std::chrono::steady_clock::now()),
+                          last_cache_send_(std::chrono::steady_clock::now()) {}
+
+    bool shouldEncodeH264(const SceneAnalysis& scene) {
+        return shouldEncode(scene);
+    }
+
+    bool shouldEncodeMJPEG(const SceneAnalysis& scene) {
+        return shouldEncode(scene);
+    }
+
+    void onFrameEncoded(const std::vector<unsigned char>& frame_data, bool is_h264) {
+        // Cache the frame when transitioning to static mode
+        if (current_state_ == StreamingState::STABILIZING) {
+            if (is_h264) {
+                // Only cache I-frames for H.264 to avoid decoder issues
+                if (isIFrame(frame_data)) {
+                    cached_h264_frame_ = frame_data;
+                    std::cout << "[CACHE] Cached H.264 I-frame (" << frame_data.size() << " bytes)" << std::endl;
+                } else {
+                    std::cout << "[CACHE] Skipping H.264 P-frame (waiting for I-frame)" << std::endl;
+                    return; // Don't set has_cached_frames_ yet
+                }
+            } else {
+                // Always cache MJPEG frames (they're always complete)
+                cached_mjpeg_frame_ = frame_data;
+                std::cout << "[CACHE] Cached MJPEG frame (" << frame_data.size() << " bytes)" << std::endl;
+            }
+            has_cached_frames_ = true;
+            cache_timestamp_ = std::chrono::steady_clock::now();
+        }
+    }
+
+    template<typename H264Handler, typename MJPEGHandler>
+    void sendCachedFrame(H264Handler& h264_handler, MJPEGHandler& mjpeg_handler) {
+        if (!has_cached_frames_) return;
+
+        auto now = std::chrono::steady_clock::now();
+        auto time_since_last_send = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_cache_send_);
+
+        // Only send cached frame if enough time has passed (throttling)
+        if (time_since_last_send >= cache_send_interval_) {
+            if (!cached_h264_frame_.empty()) {
+                h264_handler(cached_h264_frame_);
+            }
+            if (!cached_mjpeg_frame_.empty()) {
+                mjpeg_handler(cached_mjpeg_frame_);
+            }
+            last_cache_send_ = now;
+
+            // Debug: Log cache transmission
+            static int cache_send_count = 0;
+            std::cout << "[CACHE] Sent cached frame #" << ++cache_send_count
+                      << " (interval: " << time_since_last_send.count() << "ms)" << std::endl;
+        }
+    }
+
+private:
+    bool shouldEncode(const SceneAnalysis& scene) {
+        auto now = std::chrono::steady_clock::now();
+
+        // Only log state changes, not every frame
+        static int last_logged_state = -1;
+        if (static_cast<int>(current_state_) != last_logged_state) {
+            std::cout << "[DEBUG] State=" << static_cast<int>(current_state_)
+                      << ", motion=" << scene.motion_detected
+                      << ", af_stable=" << scene.af_stable
+                      << ", motion_level=" << scene.motion_level << std::endl;
+            last_logged_state = static_cast<int>(current_state_);
+        }
+
+        switch (current_state_) {
+            case StreamingState::STARTUP: {
+                auto startup_duration = std::chrono::duration_cast<std::chrono::seconds>(now - startup_time_);
+                if (startup_duration > std::chrono::seconds(10)) {
+                    transitionTo(scene.motion_detected ? StreamingState::MOTION_ACTIVE : StreamingState::STABILIZING);
+                }
+                return true;
+            }
+
+            case StreamingState::MOTION_ACTIVE: {
+                if (!scene.motion_detected && scene.motion_level < 1.0f) {
+                    transitionTo(StreamingState::STABILIZING);
+                    stabilize_start_ = now;
+                }
+                return true;
+            }
+
+            case StreamingState::STABILIZING: {
+                auto stabilize_duration = std::chrono::duration_cast<std::chrono::seconds>(now - stabilize_start_);
+                if (scene.af_stable && scene.since_last_motion > std::chrono::milliseconds(2000)) {
+                    transitionTo(StreamingState::STATIC_CACHED);
+                    return true; // Last encoding before cache mode
+                }
+                if (scene.motion_detected) {
+                    transitionTo(StreamingState::MOTION_ACTIVE);
+                }
+                return true;
+            }
+
+            case StreamingState::STATIC_CACHED: {
+                if (scene.motion_detected || scene.motion_level > 2.0f) {
+                    transitionTo(StreamingState::MOTION_RESUME);
+                    return true;
+                }
+                // Refresh cache every 30 seconds
+                auto cache_age = std::chrono::duration_cast<std::chrono::seconds>(now - cache_timestamp_);
+                if (cache_age > std::chrono::seconds(30)) {
+                    cache_timestamp_ = now;
+                    return true;
+                }
+                return false; // Send cached frame
+            }
+
+            case StreamingState::MOTION_RESUME: {
+                transitionTo(StreamingState::MOTION_ACTIVE);
+                return true;
+            }
+        }
+        return true;
+    }
+
+    void transitionTo(StreamingState new_state) {
+        if (new_state != current_state_) {
+            const char* state_names[] = {"STARTUP", "MOTION_ACTIVE", "STABILIZING", "STATIC_CACHED", "MOTION_RESUME"};
+            std::cout << "StreamingState: " << state_names[static_cast<int>(current_state_)]
+                      << " -> " << state_names[static_cast<int>(new_state)] << std::endl;
+            current_state_ = new_state;
+        }
+    }
+
+    // Configuration methods
+public:
+    void setCacheSendInterval(std::chrono::milliseconds interval) {
+        cache_send_interval_ = interval;
+        std::cout << "Cache send interval set to " << interval.count() << "ms" << std::endl;
+    }
+
+private:
+    // Detect if frame is an I-frame (keyframe)
+    bool isIFrame(const std::vector<unsigned char>& h264_data) const {
+        // H.264 NAL unit header analysis
+        // Look for NAL unit type 5 (IDR slice) or type 7/8 (SPS/PPS)
+        for (size_t i = 0; i < h264_data.size() - 4; ++i) {
+            // Find NAL unit start code (0x00 0x00 0x00 0x01)
+            if (h264_data[i] == 0x00 && h264_data[i+1] == 0x00 &&
+                h264_data[i+2] == 0x00 && h264_data[i+3] == 0x01) {
+
+                if (i + 4 < h264_data.size()) {
+                    uint8_t nal_type = h264_data[i+4] & 0x1F;
+                    // NAL type 5 = IDR slice (I-frame), 7 = SPS, 8 = PPS
+                    if (nal_type == 5 || nal_type == 7 || nal_type == 8) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+};
 
 class MotionDetector {
 private:
@@ -64,10 +412,18 @@ public:
                   << " (downsample: " << downsample_factor_ << ")" << std::endl;
     }
 
-    bool detectMotion(unsigned char* y_data, size_t y_size) {
-        if (!y_data || y_size < full_width_ * full_height_) {
+    bool detectMotion(int dma_fd, size_t total_size, size_t y_size) {
+        if (dma_fd < 0 || y_size < full_width_ * full_height_) {
             return false;
         }
+
+        // Use shared buffer pool
+        void* mapped_data = g_buffer_pool.getMapping(dma_fd, total_size, "MotionDetector");
+        if (!mapped_data) {
+            return false;
+        }
+
+        unsigned char* y_data = static_cast<unsigned char*>(mapped_data);
 
         // Skip frames optimization - only process every N-th frame
         frame_counter_++;
@@ -1004,6 +1360,10 @@ private:
     // Motion detection
     std::unique_ptr<MotionDetector> motion_detector_;
 
+    // Motion tail recording (continue for 5 seconds after motion stops)
+    std::chrono::steady_clock::time_point last_motion_time_;
+    std::chrono::seconds motion_tail_duration_{5}; // Continue recording for 5 seconds after motion stops
+
     // Statistics
     int frames_captured_ = 0;
     bool capture_running_ = false;
@@ -1023,11 +1383,22 @@ private:
         bool use_windows = false;    // Use specific AF windows
     } af_settings_;
 
+protected:
+    // Members needed by SmartCapturerV2
+    std::unique_ptr<CameraConfiguration>& getConfig() { return config_; }
+    std::unique_ptr<MotionDetector>& getMotionDetector() { return motion_detector_; }
+    std::unique_ptr<H264Encoder>& getH264Encoder() { return h264_encoder_; }
+    std::unique_ptr<JpegEncoder>& getJpegEncoder() { return jpeg_encoder_; }
+    MjpegHandler& getMjpegHandler() { return mjpeg_handler_; }
+    H264Handler& getH264Handler() { return h264_handler_; }
+    bool isMjpegEnabled() const { return use_mjpeg_; }
+
 public:
     CapturerV2(MjpegHandler mjpeg_handler, H264Handler h264_handler, int width = 1920, int height = 1080)
         : cm_(std::make_unique<CameraManager>()),
           mjpeg_handler_(std::move(mjpeg_handler)),
-          h264_handler_(std::move(h264_handler)) {
+          h264_handler_(std::move(h264_handler)),
+          last_motion_time_(std::chrono::steady_clock::now()) {
 
         // Initialize encoders
         jpeg_encoder_ = std::make_unique<JpegEncoder>(width, height, 90); // Quality=90
@@ -1197,7 +1568,7 @@ public:
         return ss.str();
     }
 
-    void processingFrameBuffer(const FrameBuffer *buffer) {
+    virtual void processingFrameBuffer(const FrameBuffer *buffer) {
         bool h264_sent = false;
 
         // Calculate total YUV size and store individual plane sizes
@@ -1210,20 +1581,37 @@ public:
         const FrameBuffer::Plane &first_plane = buffer->planes()[0];
 
         // Motion detection BEFORE encoding (using Y plane only)
+        bool should_record = true;
         if (motion_detector_ && plane_sizes.size() >= 1) {
-            void *mapped_data = mmap(nullptr, total_yuv_size, PROT_READ, MAP_SHARED, first_plane.fd.get(), 0);
-            if (mapped_data != MAP_FAILED) {
-                unsigned char* y_data = static_cast<unsigned char*>(mapped_data);
-                bool motion = motion_detector_->detectMotion(y_data, plane_sizes[0]);
+            bool motion = motion_detector_->detectMotion(first_plane.fd.get(), total_yuv_size, plane_sizes[0]);
 
-                if (motion) {
-                    std::cout << "[MOTION] Detected! Level: " << std::fixed << std::setprecision(2)
-                              << motion_detector_->getMotionLevel() << "%, Pixels: "
-                              << motion_detector_->getMotionPixelCount() << std::endl;
+            if (motion) {
+                // Update last motion time
+                last_motion_time_ = std::chrono::steady_clock::now();
+                std::cout << "[MOTION] Detected! Level: " << std::fixed << std::setprecision(2)
+                          << motion_detector_->getMotionLevel() << "%, Pixels: "
+                          << motion_detector_->getMotionPixelCount() << std::endl;
+            } else {
+                // Check if we're still in the "tail" recording period
+                auto now = std::chrono::steady_clock::now();
+                auto time_since_motion = std::chrono::duration_cast<std::chrono::seconds>(now - last_motion_time_);
+
+                if (time_since_motion > motion_tail_duration_) {
+                    // Motion stopped and tail period expired - skip recording
+                    // std::cout << "[MOTION] No motion for " << time_since_motion.count()
+                    //           << "s, skipping frame" << std::endl;
+                    should_record = false;
+                } else {
+                    // Still in tail recording period
+                    // std::cout << "[MOTION] Tail recording (" << time_since_motion.count()
+                    //           << "/" << motion_tail_duration_.count() << "s)" << std::endl;
                 }
-
-                munmap(mapped_data, total_yuv_size);
             }
+        }
+
+        // Skip encoding if motion-based recording is disabled
+        if (!should_record) {
+            return;
         }
 
         // Try H.264 encoding and output if enabled
@@ -1245,9 +1633,9 @@ public:
 
         // JPEG encoding and output if enabled
         if (use_mjpeg_) {
-            void *mapped_data = mmap(nullptr, total_yuv_size, PROT_READ, MAP_SHARED, first_plane.fd.get(), 0);
-            if (mapped_data == MAP_FAILED) {
-                std::cerr << "JPEG: Failed to mmap YUV data: " << strerror(errno) << std::endl;
+            void *mapped_data = g_buffer_pool.getMapping(first_plane.fd.get(), total_yuv_size, "MJPEG");
+            if (!mapped_data) {
+                std::cerr << "JPEG: Failed to get buffer mapping" << std::endl;
                 if (!h264_sent) {
                     std::cerr << "No frame output - both H.264 and JPEG failed" << std::endl;
                 }
@@ -1263,8 +1651,7 @@ public:
                         std::cerr << "No frame output - both H.264 and JPEG failed" << std::endl;
                     }
                 }
-
-                munmap(mapped_data, total_yuv_size);
+                // No munmap needed - SharedBufferPool manages this automatically!
             }
         }
 
@@ -1277,13 +1664,14 @@ public:
             }
         }
     }
-    
-    void requestComplete(Request *req) {
+
+
+    virtual void requestComplete(Request *req) {
         if (req->status() == Request::RequestComplete) {
             frames_captured_++;
-            
+
             // std::cout << "Frame #" << frames_captured_ << " captured successfully" << std::endl;
-            
+
             const Request::BufferMap &buffers = req->buffers();
             for (auto bufferPair : buffers) {
                 FrameBuffer *buffer = bufferPair.second;
@@ -1349,6 +1737,7 @@ public:
     void setAutofocusRange(int range) {
         af_settings_.range = range;
     }
+
 
     void enableH264Encoding(bool enable) {
         use_h264_ = enable && h264_encoder_;
@@ -1418,6 +1807,15 @@ public:
             std::cout << "Motion detection frame skip set to " << skip
                       << " (processing every " << skip << " frame" << (skip > 1 ? "s" : "") << ")" << std::endl;
         }
+    }
+
+    void setMotionTailDuration(int seconds) {
+        motion_tail_duration_ = std::chrono::seconds(seconds);
+        std::cout << "Motion tail recording duration set to " << seconds << " seconds" << std::endl;
+    }
+
+    int getMotionTailDuration() const {
+        return static_cast<int>(motion_tail_duration_.count());
     }
 
     bool setH264GopSize(int gop_size) {
@@ -1520,6 +1918,229 @@ public:
     }
 };
 
+// Smart streaming wrapper with policy-based streaming decisions
+template<typename MjpegHandler, typename H264Handler, typename StreamingPolicy = AlwaysStreamPolicy>
+class SmartCapturerV2 : public CapturerV2<MjpegHandler, H264Handler> {
+private:
+    StreamingPolicy streaming_policy_;
+    std::chrono::steady_clock::time_point last_motion_time_;
+    std::chrono::steady_clock::time_point last_af_stable_time_;
+
+    // AF state monitoring (moved from base class)
+    int current_af_state_ = -1;        // Current AF state (-1 = unknown)
+    bool af_locked_ = false;           // True when AF is locked/focused
+    std::chrono::steady_clock::time_point af_last_change_;  // When AF state last changed
+    int af_scan_count_ = 0;            // Count of AF scan cycles
+
+public:
+    SmartCapturerV2(MjpegHandler mjpeg_handler, H264Handler h264_handler, int width = 1920, int height = 1080)
+        : CapturerV2<MjpegHandler, H264Handler>(std::move(mjpeg_handler), std::move(h264_handler), width, height),
+          last_motion_time_(std::chrono::steady_clock::now()),
+          last_af_stable_time_(std::chrono::steady_clock::now()) {
+
+        std::cout << "SmartCapturerV2 initialized with streaming policy" << std::endl;
+    }
+
+    // Override requestComplete to add AF monitoring
+    void requestComplete(Request *req) override {
+        if (req->status() == Request::RequestComplete) {
+            // AF monitoring first
+            monitorAutofocusState(req);
+
+            // Call base class implementation
+            CapturerV2<MjpegHandler, H264Handler>::requestComplete(req);
+        } else {
+            std::cerr << "Frame capture error" << std::endl;
+        }
+    }
+
+protected:
+    // Override frame processing to add smart streaming logic
+    void processingFrameBuffer(const FrameBuffer *buffer) override {
+        if (!buffer) return;
+
+        // Calculate total YUV size (sum of all planes)
+        size_t total_yuv_size = 0;
+        std::vector<size_t> plane_sizes;
+        for (const auto &plane : buffer->planes()) {
+            plane_sizes.push_back(plane.length);
+            total_yuv_size += plane.length;
+        }
+        const FrameBuffer::Plane &first_plane = buffer->planes()[0];
+
+        // Motion detection (always run for scene analysis)
+        if (this->getMotionDetector()) {
+            this->getMotionDetector()->detectMotion(first_plane.fd.get(), total_yuv_size, plane_sizes[0]);
+        }
+
+        // Analyze current scene state
+        SceneAnalysis scene = analyzeScene(first_plane, total_yuv_size);
+
+        // Make streaming decisions based on policy
+        bool should_encode_h264 = streaming_policy_.shouldEncodeH264(scene);
+        bool should_encode_mjpeg = streaming_policy_.shouldEncodeMJPEG(scene);
+        bool h264_sent = false;
+
+        // H.264 encoding if enabled and decided by policy
+        if (this->isH264OutputEnabled() && should_encode_h264) {
+            std::vector<unsigned char> h264_data;
+            if (this->getH264Encoder() && this->getH264Encoder()->encodeDMA(first_plane.fd.get(), 0, total_yuv_size, h264_data)) {
+                this->getH264Handler()(h264_data);
+                streaming_policy_.onFrameEncoded(h264_data, true);
+                h264_sent = true;
+            }
+        }
+
+        // MJPEG encoding if enabled and decided by policy
+        if (this->isMjpegEnabled() && should_encode_mjpeg) {
+            void *mapped_data = g_buffer_pool.getMapping(first_plane.fd.get(), total_yuv_size, "SmartMJPEG");
+            if (mapped_data) {
+                std::vector<unsigned char> jpeg_data;
+                unsigned char* yuv_data = static_cast<unsigned char*>(mapped_data);
+
+                if (this->getJpegEncoder()->encode(yuv_data, total_yuv_size, jpeg_data)) {
+                    this->getMjpegHandler()(jpeg_data);
+                    streaming_policy_.onFrameEncoded(jpeg_data, false);
+                } else {
+                    std::cerr << "Smart JPEG encoding error" << std::endl;
+                }
+            }
+        }
+
+        // Send cached frames if policy decides not to encode
+        if (!should_encode_h264 || !should_encode_mjpeg) {
+            streaming_policy_.sendCachedFrame(this->getH264Handler(), this->getMjpegHandler());
+        }
+    }
+
+    // Monitor autofocus state from request metadata (moved from base class)
+    void monitorAutofocusState(Request *req) {
+        const auto& metadata = req->metadata();
+
+        // Check if AF state is available in metadata
+        if (metadata.contains(controls::AfState.id())) {
+            auto af_state_opt = metadata.get(controls::AfState);
+            if (!af_state_opt) return;
+            int new_af_state = *af_state_opt;
+
+            // AF state changed?
+            if (new_af_state != current_af_state_) {
+                auto now = std::chrono::steady_clock::now();
+
+                // Log state change
+                const char* state_names[] = {"Idle", "Scanning", "Focused", "Failed"};
+                const char* old_name = (current_af_state_ >= 0 && current_af_state_ <= 3) ?
+                                       state_names[current_af_state_] : "Unknown";
+                const char* new_name = (new_af_state >= 0 && new_af_state <= 3) ?
+                                       state_names[new_af_state] : "Unknown";
+
+                std::cout << "AF state: " << old_name << " -> " << new_name << std::endl;
+
+                // Update state tracking
+                current_af_state_ = new_af_state;
+                af_last_change_ = now;
+
+                // Check for specific state transitions
+                if (new_af_state == 1) {  // Scanning
+                    af_scan_count_++;
+                    af_locked_ = false;
+                    std::cout << "AF scanning... (cycle #" << af_scan_count_ << ")" << std::endl;
+                } else if (new_af_state == 2) {  // Focused
+                    af_locked_ = true;
+                    std::cout << "AF LOCKED! Focus achieved after " << af_scan_count_
+                              << " scan cycles" << std::endl;
+                } else if (new_af_state == 3) {  // Failed
+                    af_locked_ = false;
+                    std::cout << "AF failed to find focus" << std::endl;
+                } else if (new_af_state == 0) {  // Idle
+                    af_locked_ = false;
+                }
+            }
+        }
+
+        // Also check lens position if available
+        if (metadata.contains(controls::LensPosition.id())) {
+            auto lens_pos_opt = metadata.get(controls::LensPosition);
+            if (!lens_pos_opt) return;
+            float lens_pos = *lens_pos_opt;
+            // Only log significant lens movements to avoid spam
+            static float last_logged_pos = -999.0f;
+            if (std::abs(lens_pos - last_logged_pos) > 0.1f) {
+                std::cout << "Lens position: " << std::fixed << std::setprecision(2)
+                          << lens_pos << std::endl;
+                last_logged_pos = lens_pos;
+            }
+        }
+    }
+
+private:
+    SceneAnalysis analyzeScene(const FrameBuffer::Plane &plane, size_t total_size) {
+        SceneAnalysis scene;
+        auto now = std::chrono::steady_clock::now();
+
+        // Motion analysis
+        if (this->getMotionDetector()) {
+            scene.motion_detected = this->getMotionDetector()->isMotionDetected();
+            scene.motion_level = this->getMotionDetector()->getMotionLevel();
+
+            if (scene.motion_detected) {
+                last_motion_time_ = now;
+            }
+            scene.since_last_motion = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_motion_time_);
+        }
+
+        // AF stability analysis
+        scene.af_stable = isAutofocusStable();
+        if (scene.af_stable) {
+            last_af_stable_time_ = now;
+        }
+        scene.since_af_stable = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_af_stable_time_);
+
+        // Remove per-frame logging to reduce spam
+
+        return scene;
+    }
+
+    // AF state monitoring methods (moved from base class)
+    bool isAutofocusLocked() const {
+        return af_locked_;
+    }
+
+    int getAutofocusState() const {
+        return current_af_state_;
+    }
+
+    const char* getAutofocusStateName() const {
+        const char* state_names[] = {"Idle", "Scanning", "Focused", "Failed"};
+        if (current_af_state_ >= 0 && current_af_state_ <= 3) {
+            return state_names[current_af_state_];
+        }
+        return "Unknown";
+    }
+
+    int getAutofocusScanCount() const {
+        return af_scan_count_;
+    }
+
+    // Check if AF has been stable (locked) for specified duration
+    bool isAutofocusStable(std::chrono::milliseconds duration = std::chrono::milliseconds(500)) const {
+        if (!af_locked_) return false;
+        auto now = std::chrono::steady_clock::now();
+        auto time_since_change = std::chrono::duration_cast<std::chrono::milliseconds>(now - af_last_change_);
+        return time_since_change >= duration;
+    }
+
+public:
+    // Access to streaming policy for configuration
+    StreamingPolicy& getStreamingPolicy() {
+        return streaming_policy_;
+    }
+
+    const StreamingPolicy& getStreamingPolicy() const {
+        return streaming_policy_;
+    }
+};
+
 int main(int argc, char *argv[]) {
     std::cout << "Camera Module v3 + Pi Zero 2W + libcamera" << std::endl;
 
@@ -1536,7 +2157,22 @@ int main(int argc, char *argv[]) {
         TcpSender tcp_sender_h264(std::string(argv[1]), std::stoi(argv[2])); // Different port
         H264FrameHandler<TcpSender> h264_handler(std::move(tcp_sender_h264));
 
+        // Regular capturer (always encoding)
         CapturerV2 capturer(std::move(mjpeg_handler), std::move(h264_handler));
+
+        // Smart streaming alternatives (uncomment to use):
+        //
+        // Option 1: Motion-triggered streaming
+        // SmartCapturerV2<MjpegFrameHandler<TcpSender>, H264FrameHandler<TcpSender>, MotionStreamPolicy>
+        //     capturer(std::move(mjpeg_handler), std::move(h264_handler));
+        //
+        // Option 2: Hybrid intelligent streaming
+        // SmartCapturerV2<MjpegFrameHandler<TcpSender>, H264FrameHandler<TcpSender>, HybridStreamPolicy>
+        //     capturer(std::move(mjpeg_handler), std::move(h264_handler));
+        //
+        // Option 3: Always stream (same as regular CapturerV2)
+        // SmartCapturerV2<MjpegFrameHandler<TcpSender>, H264FrameHandler<TcpSender>, AlwaysStreamPolicy>
+        //     capturer(std::move(mjpeg_handler), std::move(h264_handler));
 
         if (!capturer.initialize()) {
             return -1;
@@ -1555,8 +2191,10 @@ int main(int argc, char *argv[]) {
         capturer.setAutofocusRange(1); // 0=Normal, 1=Macro, 2=Full
         capturer.enableAutofocus(true);
         capturer.setFrameRate(30);  // 30 FPS
-        capturer.enableMotionDetection(true); // Enable motion detection by default
-        capturer.setMotionFrameSkip(10); // Process every 5th frame
+        capturer.enableMotionDetection(false); // Enable motion detection by default
+        capturer.setMotionFrameSkip(10); // Process every 10th frame
+        capturer.setMotionTailDuration(5); // Record for 5 seconds after motion stops
+
 
         if (capturer.isH264Available()) {
             std::cout << "H.264 hardware encoder detected!" << std::endl;
