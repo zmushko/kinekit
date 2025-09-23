@@ -1,0 +1,61 @@
+FROM arm64v8/debian:bookworm
+
+# Update first and install basic build tools in one layer
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    wget \
+    curl \
+    gnupg \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add Raspberry Pi repository GPG key and repository
+RUN curl -fsSL https://archive.raspberrypi.org/debian/raspberrypi.gpg.key | gpg --dearmor -o /usr/share/keyrings/raspberrypi-archive-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/raspberrypi-archive-keyring.gpg] https://archive.raspberrypi.org/debian/ bookworm main" | tee /etc/apt/sources.list.d/raspberrypi.list
+
+# Install dependencies in one layer
+RUN apt-get update && apt-get install -y \
+    libssl-dev \
+    liboping-dev \
+    libcjson-dev \
+    libglib2.0-dev \
+    libnm-dev \
+    libsystemd-dev \
+    libturbojpeg0-dev \
+    libv4l-dev \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y \
+    libudev-dev \
+    cmake-qt-gui \
+    openssl \
+    libssl-dev \
+    libengine-pkcs11-openssl \
+    gnutls-bin
+
+RUN apt-get update && apt-get install -y vim libpigpio-dev rpicam-apps libcamera-dev libboost-all-dev libmbedtls-dev
+RUN apt-get install -y libdbus-1-3 libdbus-1-dev
+
+# signaling server
+RUN apt-get install -y libnice-dev
+WORKDIR /
+RUN git clone https://github.com/paullouisageneau/libdatachannel.git
+WORKDIR /libdatachannel
+RUN git submodule update --init --recursive
+RUN mkdir build && cd build && cmake -DUSE_NICE=1 -DUSE_SYSTEM_LIBICE=1 -DCMAKE_BUILD_TYPE=Release .. && make -j4 && make install
+WORKDIR /home
+RUN apt-get install -y libjsoncpp-dev libssl-dev libpaho-mqtt-dev libpaho-mqttpp-dev
+RUN apt-get install -y python3-pip
+RUN apt-get install -y python3-yaml
+RUN apt-get install -y python3-ply
+RUN apt-get install -y meson ninja-build
+RUN apt-get install -y python3-jinja2
+
+
