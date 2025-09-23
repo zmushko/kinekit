@@ -20,7 +20,189 @@
 #include <fcntl.h>
 #include <poll.h>
 
+// ARM NEON intrinsics for SIMD optimization
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 using namespace libcamera;
+
+class MotionDetector {
+private:
+    // Previous Y frame (downsampled)
+    std::vector<unsigned char> prev_y_frame_;
+
+    // Frame dimensions
+    int full_width_, full_height_;      // 1920x1080
+    int sample_width_, sample_height_;  // 480x270 (каждая 4-я строка/столбец)
+
+    // Detection parameters
+    float threshold_ = 25.0f;           // Pixel difference threshold
+    float motion_area_threshold_ = 0.05f; // 5% area for motion
+    int downsample_factor_ = 4;         // Skip every 4th pixel
+
+    // Statistics
+    float last_motion_level_ = 0.0f;
+    int motion_pixel_count_ = 0;
+    bool motion_detected_ = false;
+    bool first_frame_ = true;
+
+    // Skip frames optimization
+    int frame_skip_ = 1;        // Process every N-th frame (1 = every frame)
+    int frame_counter_ = 0;     // Current frame counter
+
+public:
+    MotionDetector(int width, int height, int downsample = 4)
+        : full_width_(width), full_height_(height), downsample_factor_(downsample) {
+
+        sample_width_ = full_width_ / downsample_factor_;
+        sample_height_ = full_height_ / downsample_factor_;
+        prev_y_frame_.resize(sample_width_ * sample_height_);
+
+        std::cout << "MotionDetector initialized: " << full_width_ << "x" << full_height_
+                  << " -> " << sample_width_ << "x" << sample_height_
+                  << " (downsample: " << downsample_factor_ << ")" << std::endl;
+    }
+
+    bool detectMotion(unsigned char* y_data, size_t y_size) {
+        if (!y_data || y_size < full_width_ * full_height_) {
+            return false;
+        }
+
+        // Skip frames optimization - only process every N-th frame
+        frame_counter_++;
+        if (frame_counter_ % frame_skip_ != 0) {
+            return motion_detected_; // Return last known state
+        }
+
+        // Reset statistics
+        motion_pixel_count_ = 0;
+        motion_detected_ = false;
+
+        // Skip first frame (no previous frame to compare)
+        if (first_frame_) {
+            downsampleYFrame(y_data, prev_y_frame_.data());
+            first_frame_ = false;
+            return false;
+        }
+
+        // Downsample current frame
+        std::vector<unsigned char> current_frame(sample_width_ * sample_height_);
+        downsampleYFrame(y_data, current_frame.data());
+
+        // Compare with previous frame using NEON if available
+        int total_pixels = sample_width_ * sample_height_;
+
+#ifdef __ARM_NEON
+        motion_pixel_count_ = compareFramesNEON(current_frame.data(), prev_y_frame_.data(), total_pixels);
+#else
+        motion_pixel_count_ = compareFramesScalar(current_frame.data(), prev_y_frame_.data(), total_pixels);
+#endif
+
+        // Calculate motion level as percentage
+        last_motion_level_ = (float)motion_pixel_count_ / total_pixels * 100.0f;
+
+        // Detect motion if threshold exceeded
+        motion_detected_ = last_motion_level_ > (motion_area_threshold_ * 100.0f);
+
+        // Store current frame as previous for next iteration
+        prev_y_frame_ = std::move(current_frame);
+
+        return motion_detected_;
+    }
+
+    // Configuration methods
+    void setThreshold(float threshold) { threshold_ = threshold; }
+    void setMotionAreaThreshold(float area_threshold) { motion_area_threshold_ = area_threshold; }
+    void setDownsampleFactor(int factor) {
+        downsample_factor_ = factor;
+        sample_width_ = full_width_ / downsample_factor_;
+        sample_height_ = full_height_ / downsample_factor_;
+        prev_y_frame_.resize(sample_width_ * sample_height_);
+        first_frame_ = true; // Reset detection
+    }
+
+    void setFrameSkip(int skip) {
+        frame_skip_ = std::max(1, skip); // Minimum skip = 1 (process every frame)
+        frame_counter_ = 0; // Reset counter
+    }
+
+    // Statistics methods
+    float getMotionLevel() const { return last_motion_level_; }
+    int getMotionPixelCount() const { return motion_pixel_count_; }
+    bool isMotionDetected() const { return motion_detected_; }
+
+private:
+    void downsampleYFrame(unsigned char* full_frame, unsigned char* sampled_frame) {
+        for (int y = 0; y < sample_height_; y++) {
+            for (int x = 0; x < sample_width_; x++) {
+                // Sample every downsample_factor_-th pixel
+                int full_y = y * downsample_factor_;
+                int full_x = x * downsample_factor_;
+                int full_idx = full_y * full_width_ + full_x;
+                int sample_idx = y * sample_width_ + x;
+
+                sampled_frame[sample_idx] = full_frame[full_idx];
+            }
+        }
+    }
+
+#ifdef __ARM_NEON
+
+    int compareFramesNEON(unsigned char* current, unsigned char* previous, int total_pixels) {
+        const uint8_t threshold = (uint8_t)threshold_;
+        uint8x16_t thresh_vec = vdupq_n_u8(threshold);
+        int32x4_t motion_count_vec = vdupq_n_s32(0);
+
+        // Process 16 pixels at a time with NEON - integrated diff+count
+        int simd_size = total_pixels & ~15;
+        for (int i = 0; i < simd_size; i += 16) {
+            // Load 16 pixels from both frames
+            uint8x16_t f1 = vld1q_u8(&current[i]);
+            uint8x16_t f2 = vld1q_u8(&previous[i]);
+
+            // Calculate absolute difference and compare with threshold
+            uint8x16_t abs_diff = vabdq_u8(f1, f2);
+            uint8x16_t mask = vcgtq_u8(abs_diff, thresh_vec);
+
+            // Convert 0xFF to 1, count motion pixels
+            uint8x16_t ones = vandq_u8(mask, vdupq_n_u8(1));
+
+            // Sum up the motion pixels
+            uint16x8_t sum8 = vpaddlq_u8(ones);
+            uint32x4_t sum4 = vpaddlq_u16(sum8);
+            motion_count_vec = vaddq_s32(motion_count_vec, vreinterpretq_s32_u32(sum4));
+        }
+
+        // Sum the 4 lanes to get total motion count
+        int motion_count = vgetq_lane_s32(motion_count_vec, 0) +
+                          vgetq_lane_s32(motion_count_vec, 1) +
+                          vgetq_lane_s32(motion_count_vec, 2) +
+                          vgetq_lane_s32(motion_count_vec, 3);
+
+        // Handle remaining pixels (if any)
+        for (int i = simd_size; i < total_pixels; i++) {
+            int diff = abs(current[i] - previous[i]);
+            if (diff > threshold) {
+                motion_count++;
+            }
+        }
+
+        return motion_count;
+    }
+#endif
+
+    int compareFramesScalar(unsigned char* current, unsigned char* previous, int total_pixels) {
+        int motion_count = 0;
+        for (int i = 0; i < total_pixels; i++) {
+            int diff = abs(current[i] - previous[i]);
+            if (diff > threshold_) {
+                motion_count++;
+            }
+        }
+        return motion_count;
+    }
+};
 
 class TcpClient {
 public:
@@ -759,6 +941,9 @@ private:
     bool use_mjpeg_ = true;
     bool use_h264_output_ = false;
 
+    // Motion detection
+    std::unique_ptr<MotionDetector> motion_detector_;
+
     // Statistics
     int frames_captured_ = 0;
     bool capture_running_ = false;
@@ -787,6 +972,9 @@ public:
         // Initialize encoders
         jpeg_encoder_ = std::make_unique<JpegEncoder>(width, height, 90); // Quality=90
         h264_encoder_ = std::make_unique<H264Encoder>(width, height, 60, 5000000); // GOP=60, Bitrate=5Mbps
+
+        // Initialize motion detector
+        motion_detector_ = std::make_unique<MotionDetector>(width, height, 4); // Downsample factor 4
     }
     
     bool initialize() {
@@ -840,7 +1028,6 @@ public:
         StreamConfiguration &stream_config = config_->at(0);
         stream_config.size = Size(1920, 1080);  // Full HD
         stream_config.pixelFormat = formats::YUV420; // Efficient format
-        
         
         // Validate configuration
         CameraConfiguration::Status validation = config_->validate();
@@ -949,19 +1136,45 @@ public:
         ss << "_" << std::setfill('0') << std::setw(3) << ms.count();
         return ss.str();
     }
-    
-    void sendFrame(const FrameBuffer *buffer) {
+
+    void processingFrameBuffer(const FrameBuffer *buffer) {
         bool h264_sent = false;
+
+        // Calculate total YUV size and store individual plane sizes
+        size_t total_yuv_size = 0;
+        std::vector<size_t> plane_sizes;
+        for (const auto &plane : buffer->planes()) {
+            plane_sizes.push_back(plane.length);
+            total_yuv_size += plane.length;
+        }
+        const FrameBuffer::Plane &first_plane = buffer->planes()[0];
+
+        // YUV420 plane information (for 1920x1080):
+        // plane_sizes[0] = Y plane size (1920 * 1080 = 2,073,600 bytes)
+        // plane_sizes[1] = U plane size (960 * 540 = 518,400 bytes)
+        // plane_sizes[2] = V plane size (960 * 540 = 518,400 bytes)
+
+        // Motion detection BEFORE encoding (using Y plane only)
+        if (motion_detector_ && plane_sizes.size() >= 1) {
+            void *mapped_data = mmap(nullptr, total_yuv_size, PROT_READ, MAP_SHARED, first_plane.fd.get(), 0);
+            if (mapped_data != MAP_FAILED) {
+                unsigned char* y_data = static_cast<unsigned char*>(mapped_data);
+                bool motion = motion_detector_->detectMotion(y_data, plane_sizes[0]);
+
+                if (motion) {
+                    std::cout << "[MOTION] Detected! Level: " << std::fixed << std::setprecision(2)
+                              << motion_detector_->getMotionLevel() << "%, Pixels: "
+                              << motion_detector_->getMotionPixelCount() << std::endl;
+                }
+
+                munmap(mapped_data, total_yuv_size);
+            }
+        }
 
         // Try H.264 encoding and output if enabled
         if (use_h264_output_ && use_h264_ && h264_encoder_) {
             std::vector<unsigned char> h264_data;
-            size_t total_yuv_size = 0;
-            for (const auto &plane : buffer->planes()) {
-                total_yuv_size += plane.length;
-            }
 
-            const FrameBuffer::Plane &first_plane = buffer->planes()[0];
             if (h264_encoder_->encodeDMA(first_plane.fd.get(), 0, total_yuv_size, h264_data)) {
                 h264_handler_(h264_data);
                 h264_sent = true;
@@ -977,35 +1190,26 @@ public:
 
         // JPEG encoding and output if enabled
         if (use_mjpeg_) {
-            std::vector<unsigned char> data_vector;
-            int plane_index = 0;
-            for (const FrameBuffer::Plane &plane : buffer->planes()) {
-                size_t page_size = sysconf(_SC_PAGESIZE);
-                size_t aligned_offset = (plane.offset / page_size) * page_size;
-                size_t offset_diff = plane.offset - aligned_offset;
-                size_t map_length = plane.length + offset_diff;
-
-                void *mapped_data = mmap(nullptr, map_length, PROT_READ, MAP_SHARED, plane.fd.get(), aligned_offset);
-                if (mapped_data == MAP_FAILED) {
-                    std::cerr << "mmap failed for plane " << plane_index << std::endl;
-                    continue;
-                }
-
-                unsigned char* actual_data = static_cast<unsigned char*>(mapped_data) + offset_diff;
-                data_vector.insert(data_vector.end(), actual_data, actual_data + plane.length);
-                munmap(mapped_data, map_length);
-                plane_index++;
-            }
-
-            std::vector<unsigned char> jpeg_data;
-            if (jpeg_encoder_->encode(data_vector.data(), data_vector.size(), jpeg_data)) {
-                mjpeg_handler_(jpeg_data);
-            } else {
-                std::cerr << "JPEG encoding error" << std::endl;
-                // If H.264 failed and JPEG also failed, we have no output
+            void *mapped_data = mmap(nullptr, total_yuv_size, PROT_READ, MAP_SHARED, first_plane.fd.get(), 0);
+            if (mapped_data == MAP_FAILED) {
+                std::cerr << "JPEG: Failed to mmap YUV data: " << strerror(errno) << std::endl;
                 if (!h264_sent) {
                     std::cerr << "No frame output - both H.264 and JPEG failed" << std::endl;
                 }
+            } else {
+                std::vector<unsigned char> jpeg_data;
+                unsigned char* yuv_data = static_cast<unsigned char*>(mapped_data);
+
+                if (jpeg_encoder_->encode(yuv_data, total_yuv_size, jpeg_data)) {
+                    mjpeg_handler_(jpeg_data);
+                } else {
+                    std::cerr << "JPEG encoding error" << std::endl;
+                    if (!h264_sent) {
+                        std::cerr << "No frame output - both H.264 and JPEG failed" << std::endl;
+                    }
+                }
+
+                munmap(mapped_data, total_yuv_size);
             }
         }
 
@@ -1028,7 +1232,7 @@ public:
             const Request::BufferMap &buffers = req->buffers();
             for (auto bufferPair : buffers) {
                 FrameBuffer *buffer = bufferPair.second;
-                sendFrame(buffer);
+                processingFrameBuffer(buffer);
                 break;
             }
             
@@ -1115,6 +1319,50 @@ public:
 
     bool isH264OutputEnabled() const {
         return use_h264_output_;
+    }
+
+    // Motion detection methods
+    void enableMotionDetection(bool enable) {
+        if (enable && !motion_detector_) {
+            motion_detector_ = std::make_unique<MotionDetector>(1920, 1080, 4);
+        } else if (!enable) {
+            motion_detector_.reset();
+        }
+        std::cout << "Motion detection " << (enable ? "enabled" : "disabled") << std::endl;
+    }
+
+    bool isMotionDetectionEnabled() const {
+        return motion_detector_ != nullptr;
+    }
+
+    bool isMotionDetected() const {
+        return motion_detector_ ? motion_detector_->isMotionDetected() : false;
+    }
+
+    float getMotionLevel() const {
+        return motion_detector_ ? motion_detector_->getMotionLevel() : 0.0f;
+    }
+
+    void setMotionThreshold(float threshold) {
+        if (motion_detector_) {
+            motion_detector_->setThreshold(threshold);
+            std::cout << "Motion threshold set to " << threshold << std::endl;
+        }
+    }
+
+    void setMotionAreaThreshold(float area_threshold) {
+        if (motion_detector_) {
+            motion_detector_->setMotionAreaThreshold(area_threshold);
+            std::cout << "Motion area threshold set to " << (area_threshold * 100) << "%" << std::endl;
+        }
+    }
+
+    void setMotionFrameSkip(int skip) {
+        if (motion_detector_) {
+            motion_detector_->setFrameSkip(skip);
+            std::cout << "Motion detection frame skip set to " << skip
+                      << " (processing every " << skip << " frame" << (skip > 1 ? "s" : "") << ")" << std::endl;
+        }
     }
 
     bool setH264GopSize(int gop_size) {
@@ -1252,6 +1500,8 @@ int main(int argc, char *argv[]) {
         capturer.setAutofocusRange(1); // 0=Normal, 1=Macro, 2=Full
         capturer.enableAutofocus(true);
         capturer.setFrameRate(30);  // 30 FPS
+        capturer.enableMotionDetection(true); // Enable motion detection by default
+        capturer.setMotionFrameSkip(10); // Process every 5th frame
 
         if (capturer.isH264Available()) {
             std::cout << "H.264 hardware encoder detected!" << std::endl;
