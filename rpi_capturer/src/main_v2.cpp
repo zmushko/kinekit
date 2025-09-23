@@ -149,7 +149,7 @@ private:
 
 #ifdef __ARM_NEON
 
-    int compareFramesNEON(unsigned char* current, unsigned char* previous, int total_pixels) {
+    int compareFramesNEON_C(unsigned char* current, unsigned char* previous, int total_pixels) {
         const uint8_t threshold = (uint8_t)threshold_;
         uint8x16_t thresh_vec = vdupq_n_u8(threshold);
         int32x4_t motion_count_vec = vdupq_n_s32(0);
@@ -189,6 +189,66 @@ private:
         }
 
         return motion_count;
+    }
+
+    // Assembly inline version (maximum performance)
+    int compareFramesNEON_ASM(unsigned char* current, unsigned char* previous, int total_pixels) {
+        const uint8_t threshold = (uint8_t)threshold_;
+        int motion_count = 0;
+        int simd_size = total_pixels & ~15;
+
+        if (simd_size > 0) {
+            asm volatile (
+                "dup v0.16b, %w[thresh]      \n"  // v0 = threshold vector (16 copies of threshold)
+                "movi v1.4s, #0              \n"  // v1 = motion count accumulator (4x32bit zeros)
+                "movi v10.16b, #1            \n"  // v10 = vector of 1s (create once outside loop)
+                "mov x0, #0                  \n"  // x0 = loop counter (byte offset)
+
+                "1:                          \n"  // loop start label
+                "ldr q2, [%[curr], x0]       \n"  // load 16 current pixels into v2
+                "ldr q3, [%[prev], x0]       \n"  // load 16 previous pixels into v3
+
+                "uabd v4.16b, v2.16b, v3.16b \n"  // absolute difference: |curr - prev|
+                "cmhi v5.16b, v4.16b, v0.16b \n"  // compare: diff > threshold (0xFF if true, 0x00 if false)
+                "and v6.16b, v5.16b, v10.16b \n"  // convert 0xFF to 1, 0x00 to 0 (using pre-created v10)
+
+                "uaddlp v7.8h, v6.16b       \n"  // sum adjacent pairs: 16x8bit -> 8x16bit
+                "uaddlp v8.4s, v7.8h        \n"  // sum adjacent pairs: 8x16bit -> 4x32bit
+                "add v1.4s, v1.4s, v8.4s    \n"  // accumulate into motion counter
+
+                "add x0, x0, #16             \n"  // increment byte offset by 16
+                "cmp x0, %[size]             \n"  // compare with simd_size
+                "b.lt 1b                     \n"  // branch if less than (continue loop)
+
+                "addv s9, v1.4s              \n"  // horizontal add all 4 lanes of v1
+                "mov %w[result], v9.s[0]     \n"  // extract 32-bit result to motion_count
+
+                : [result] "=r" (motion_count)                                    // output
+                : [curr] "r" (current), [prev] "r" (previous),                   // input pointers
+                  [thresh] "r" (threshold), [size] "r" ((long)simd_size)         // input values
+                : "x0", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "memory"  // clobbered
+            );
+        }
+
+        // Handle remaining pixels (if any) with scalar code
+        for (int i = simd_size; i < total_pixels; i++) {
+            int diff = abs(current[i] - previous[i]);
+            if (diff > threshold) {
+                motion_count++;
+            }
+        }
+
+        return motion_count;
+    }
+
+    int compareFramesNEON(unsigned char* current, unsigned char* previous, int total_pixels) {
+        #define USE_ASM_VERSION 1
+
+        #if USE_ASM_VERSION
+            return compareFramesNEON_ASM(current, previous, total_pixels);
+        #else
+            return compareFramesNEON_C(current, previous, total_pixels);
+        #endif
     }
 #endif
 
@@ -1148,11 +1208,6 @@ public:
             total_yuv_size += plane.length;
         }
         const FrameBuffer::Plane &first_plane = buffer->planes()[0];
-
-        // YUV420 plane information (for 1920x1080):
-        // plane_sizes[0] = Y plane size (1920 * 1080 = 2,073,600 bytes)
-        // plane_sizes[1] = U plane size (960 * 540 = 518,400 bytes)
-        // plane_sizes[2] = V plane size (960 * 540 = 518,400 bytes)
 
         // Motion detection BEFORE encoding (using Y plane only)
         if (motion_detector_ && plane_sizes.size() >= 1) {
