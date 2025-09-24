@@ -1360,7 +1360,7 @@ private:
     std::chrono::seconds motion_tail_duration_{5}; // Continue recording for 5 seconds after motion stops
 
     // Statistics
-    unsigned long frames_captured_ = 0;
+    int frames_captured_ = 0;
     bool capture_running_ = false;
 
     // Frame rate settings
@@ -1621,6 +1621,11 @@ public:
 
         // Skip encoding if motion-based recording is disabled
         if (!should_record) {
+            // int acting_fps = target_fps_;
+            // if (static_mode_) {
+            //     acting_fps = std::max(1, target_fps_ / motion_frame_skip_);
+            // }
+
             static_mode_ = true; // Switch to static mode if no motion
             return;
         }
@@ -1666,6 +1671,20 @@ public:
                 // No munmap needed - SharedBufferPool manages this automatically!
             }
         }
+
+        // Calculate frame interval for target FPS
+        auto frame_interval = std::chrono::microseconds(1000000 / target_fps_);
+        auto now = std::chrono::steady_clock::now();
+
+        if (frames_captured_ > 1 && target_fps_ < 30) {  // Skip timing for first frame
+            auto elapsed = now - last_frame_time_;
+            if (elapsed < frame_interval) {
+                auto sleep_time = frame_interval - elapsed;
+                std::this_thread::sleep_for(sleep_time);
+            }
+        }
+
+        last_frame_time_ = std::chrono::steady_clock::now();
     }
 
     virtual void requestComplete(Request *req) {
@@ -1683,25 +1702,6 @@ public:
             
             // Re-queue request with FPS throttling
             if (capture_running_) {
-                int acting_fps = target_fps_;
-                if (static_mode_) {
-                    acting_fps = std::max(1, target_fps_ / motion_frame_skip_);
-                }
-
-                // Calculate frame interval for target FPS
-                auto frame_interval = std::chrono::microseconds(1000000 / acting_fps);
-                auto now = std::chrono::steady_clock::now();
-
-                if (frames_captured_ > 1 && acting_fps < 30) {  // Skip timing for first frame
-                    auto elapsed = now - last_frame_time_;
-                    if (elapsed < frame_interval) {
-                        auto sleep_time = frame_interval - elapsed;
-                        std::this_thread::sleep_for(sleep_time);
-                    }
-                }
-
-                last_frame_time_ = std::chrono::steady_clock::now();
-
                 req->reuse(Request::ReuseBuffers);
 
                 ControlList af_controls = buildAutofocusControls();
