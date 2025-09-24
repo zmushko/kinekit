@@ -395,10 +395,6 @@ private:
     bool motion_detected_ = false;
     bool first_frame_ = true;
 
-    // Skip frames optimization
-    int frame_skip_ = 1;        // Process every N-th frame (1 = every frame)
-    int frame_counter_ = 0;     // Current frame counter
-
 public:
     MotionDetector(int width, int height, int downsample = 4)
         : full_width_(width), full_height_(height), downsample_factor_(downsample) {
@@ -424,12 +420,6 @@ public:
         }
 
         unsigned char* y_data = static_cast<unsigned char*>(mapped_data);
-
-        // Skip frames optimization - only process every N-th frame
-        frame_counter_++;
-        if (frame_counter_ % frame_skip_ != 0) {
-            return motion_detected_; // Return last known state
-        }
 
         // Reset statistics
         motion_pixel_count_ = 0;
@@ -478,11 +468,6 @@ public:
         first_frame_ = true; // Reset detection
     }
 
-    void setFrameSkip(int skip) {
-        frame_skip_ = std::max(1, skip); // Minimum skip = 1 (process every frame)
-        frame_counter_ = 0; // Reset counter
-    }
-
     // Statistics methods
     float getMotionLevel() const { return last_motion_level_; }
     int getMotionPixelCount() const { return motion_pixel_count_; }
@@ -490,15 +475,25 @@ public:
 
 private:
     void downsampleYFrame(unsigned char* full_frame, unsigned char* sampled_frame) {
-        for (int y = 0; y < sample_height_; y++) {
-            for (int x = 0; x < sample_width_; x++) {
-                // Sample every downsample_factor_-th pixel
-                int full_y = y * downsample_factor_;
-                int full_x = x * downsample_factor_;
-                int full_idx = full_y * full_width_ + full_x;
-                int sample_idx = y * sample_width_ + x;
+        const int block_size = 16;  // Process 16 rows at a time for better cache locality
 
-                sampled_frame[sample_idx] = full_frame[full_idx];
+        for (int block_y = 0; block_y < sample_height_; block_y += block_size) {
+            int end_y = std::min(block_y + block_size, sample_height_);
+
+            // Prefetch next block data while processing current block
+            if (block_y + block_size < sample_height_) {
+                int next_block_y = (block_y + block_size) * downsample_factor_;
+                __builtin_prefetch(&full_frame[next_block_y * full_width_], 0, 1);
+            }
+
+            for (int y = block_y; y < end_y; y++) {
+                for (int x = 0; x < sample_width_; x++) {
+                    // Sample every downsample_factor_-th pixel
+                    int full_idx = y * downsample_factor_ * full_width_ + x * downsample_factor_;
+                    int sample_idx = y * sample_width_ + x;
+
+                    sampled_frame[sample_idx] = full_frame[full_idx];
+                }
             }
         }
     }
@@ -1365,12 +1360,17 @@ private:
     std::chrono::seconds motion_tail_duration_{5}; // Continue recording for 5 seconds after motion stops
 
     // Statistics
-    int frames_captured_ = 0;
+    unsigned long frames_captured_ = 0;
     bool capture_running_ = false;
 
     // Frame rate settings
     int target_fps_ = 30;  // Default 30 FPS
     std::chrono::steady_clock::time_point last_frame_time_;
+    bool static_mode_ = false; // If true, disable motion detection and capture continuously
+
+    // Motion detection frame skip control
+    int motion_frame_skip_ = 1;        // Process every N-th frame (1 = every frame)
+    int motion_frame_counter_ = 0;     // Current frame counter
 
     // Autofocus settings
     struct AutofocusSettings {
@@ -1583,7 +1583,17 @@ public:
         // Motion detection BEFORE encoding (using Y plane only)
         bool should_record = true;
         if (motion_detector_ && plane_sizes.size() >= 1) {
-            bool motion = motion_detector_->detectMotion(first_plane.fd.get(), total_yuv_size, plane_sizes[0]);
+            // Frame skipping optimization - only process every N-th frame
+            motion_frame_counter_++;
+            bool should_detect = static_mode_ ? true : (motion_frame_counter_ % motion_frame_skip_ == 0);
+
+            bool motion = false;
+            if (should_detect) {
+                motion = motion_detector_->detectMotion(first_plane.fd.get(), total_yuv_size, plane_sizes[0]);
+            } else {
+                // Use last known motion state when skipping frames
+                motion = motion_detector_->isMotionDetected();
+            }
 
             if (motion) {
                 // Update last motion time
@@ -1611,8 +1621,10 @@ public:
 
         // Skip encoding if motion-based recording is disabled
         if (!should_record) {
+            static_mode_ = true; // Switch to static mode if no motion
             return;
         }
+        static_mode_ = false; // Reset static mode if capturing
 
         // Try H.264 encoding and output if enabled
         if (use_h264_output_ && use_h264_ && h264_encoder_) {
@@ -1654,17 +1666,7 @@ public:
                 // No munmap needed - SharedBufferPool manages this automatically!
             }
         }
-
-        // Warn if no output is enabled
-        if (!use_mjpeg_ && !use_h264_output_) {
-            static bool warned = false;
-            if (!warned) {
-                std::cerr << "Warning: No output formats enabled!" << std::endl;
-                warned = true;
-            }
-        }
     }
-
 
     virtual void requestComplete(Request *req) {
         if (req->status() == Request::RequestComplete) {
@@ -1681,11 +1683,16 @@ public:
             
             // Re-queue request with FPS throttling
             if (capture_running_) {
+                int acting_fps = target_fps_;
+                if (static_mode_) {
+                    acting_fps = std::max(1, target_fps_ / motion_frame_skip_);
+                }
+
                 // Calculate frame interval for target FPS
-                auto frame_interval = std::chrono::microseconds(1000000 / target_fps_);
+                auto frame_interval = std::chrono::microseconds(1000000 / acting_fps);
                 auto now = std::chrono::steady_clock::now();
 
-                if (frames_captured_ > 1 && target_fps_ < 30) {  // Skip timing for first frame
+                if (frames_captured_ > 1 && acting_fps < 30) {  // Skip timing for first frame
                     auto elapsed = now - last_frame_time_;
                     if (elapsed < frame_interval) {
                         auto sleep_time = frame_interval - elapsed;
@@ -1802,11 +1809,10 @@ public:
     }
 
     void setMotionFrameSkip(int skip) {
-        if (motion_detector_) {
-            motion_detector_->setFrameSkip(skip);
-            std::cout << "Motion detection frame skip set to " << skip
-                      << " (processing every " << skip << " frame" << (skip > 1 ? "s" : "") << ")" << std::endl;
-        }
+        motion_frame_skip_ = std::max(1, skip); // Minimum skip = 1 (process every frame)
+        motion_frame_counter_ = 0; // Reset counter
+        std::cout << "Motion detection frame skip set to " << skip
+                  << " (processing every " << skip << " frame" << (skip > 1 ? "s" : "") << ")" << std::endl;
     }
 
     void setMotionTailDuration(int seconds) {
@@ -2191,9 +2197,9 @@ int main(int argc, char *argv[]) {
         capturer.setAutofocusRange(1); // 0=Normal, 1=Macro, 2=Full
         capturer.enableAutofocus(true);
         capturer.setFrameRate(30);  // 30 FPS
-        capturer.enableMotionDetection(false); // Enable motion detection by default
-        capturer.setMotionFrameSkip(10); // Process every 10th frame
-        capturer.setMotionTailDuration(5); // Record for 5 seconds after motion stops
+        capturer.enableMotionDetection(true); // Enable motion detection by default
+        capturer.setMotionFrameSkip(30); // Process every 30th frame
+        capturer.setMotionTailDuration(3); // Record for 3 seconds after motion stops
 
 
         if (capturer.isH264Available()) {
