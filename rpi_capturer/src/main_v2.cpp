@@ -1364,9 +1364,11 @@ private:
     bool capture_running_ = false;
 
     // Frame rate settings
-    int target_fps_ = 30;  // Default 30 FPS
+    int target_fps_ = 30;      // Default 30 FPS (active mode)
+    int static_fps_ = 1;       // FPS for static mode (no motion)
     std::chrono::steady_clock::time_point last_frame_time_;
     bool static_mode_ = false; // If true, disable motion detection and capture continuously
+    ControlList fps_controls_;  // Storage for FrameDurationLimits controls
 
     // Motion detection frame skip control
     int motion_frame_skip_ = 1;        // Process every N-th frame (1 = every frame)
@@ -1598,6 +1600,13 @@ public:
             if (motion) {
                 // Update last motion time
                 last_motion_time_ = std::chrono::steady_clock::now();
+
+                // Auto-switch to high FPS when motion detected
+                if (static_mode_) {
+                    setFrameRate(target_fps_);  // Switch to active FPS (30 FPS)
+                    std::cout << "[AUTO-FPS] Motion detected! Switched to " << target_fps_ << " FPS" << std::endl;
+                }
+
                 std::cout << "[MOTION] Detected! Level: " << std::fixed << std::setprecision(2)
                           << motion_detector_->getMotionLevel() << "%, Pixels: "
                           << motion_detector_->getMotionPixelCount() << std::endl;
@@ -1611,6 +1620,10 @@ public:
                     // std::cout << "[MOTION] No motion for " << time_since_motion.count()
                     //           << "s, skipping frame" << std::endl;
                     should_record = false;
+
+                    // Auto-switch to low FPS when entering static mode
+                    setFrameRate(static_fps_);  // Switch to static FPS (1 FPS)
+                    std::cout << "[AUTO-FPS] Entering static mode. Switched to " << static_fps_ << " FPS" << std::endl;
                 } else {
                     // Still in tail recording period
                     // std::cout << "[MOTION] Tail recording (" << time_since_motion.count()
@@ -1621,11 +1634,6 @@ public:
 
         // Skip encoding if motion-based recording is disabled
         if (!should_record) {
-            // int acting_fps = target_fps_;
-            // if (static_mode_) {
-            //     acting_fps = std::max(1, target_fps_ / motion_frame_skip_);
-            // }
-
             static_mode_ = true; // Switch to static mode if no motion
             return;
         }
@@ -1672,19 +1680,7 @@ public:
             }
         }
 
-        // Calculate frame interval for target FPS
-        auto frame_interval = std::chrono::microseconds(1000000 / target_fps_);
-        auto now = std::chrono::steady_clock::now();
-
-        if (frames_captured_ > 1 && target_fps_ < 30) {  // Skip timing for first frame
-            auto elapsed = now - last_frame_time_;
-            if (elapsed < frame_interval) {
-                auto sleep_time = frame_interval - elapsed;
-                std::this_thread::sleep_for(sleep_time);
-            }
-        }
-
-        last_frame_time_ = std::chrono::steady_clock::now();
+        // No software FPS throttling needed - using hardware FrameDurationLimits
     }
 
     virtual void requestComplete(Request *req) {
@@ -1846,8 +1842,30 @@ public:
             return false;
         }
         target_fps_ = fps;
-        int64_t frame_duration_ns = 1000000000 / fps;
-        std::cout << "Target frame rate set to " << fps << " FPS (duration: " << frame_duration_ns << " ns)" << std::endl;
+
+        // Use rpicam-apps approach: set FrameDurationLimits for hardware-level FPS control
+        int64_t frame_time_us = 1000000 / fps;  // в микросекундах
+
+        try {
+            ControlList controls;
+            controls.set(controls::FrameDurationLimits,
+                        libcamera::Span<const int64_t, 2>({ frame_time_us, frame_time_us }));
+
+            // Apply to camera if it's already configured
+            if (camera_ && capture_running_) {
+                // Will be applied to next requests automatically via buildAutofocusControls()
+                std::cout << "FrameDurationLimits set to " << frame_time_us << " us (" << fps << " FPS)" << std::endl;
+            }
+
+            // Store for future requests
+            fps_controls_ = controls;
+
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to set FrameDurationLimits: " << e.what() << std::endl;
+            return false;
+        }
+
+        std::cout << "Target frame rate set to " << fps << " FPS using hardware FrameDurationLimits" << std::endl;
         return true;
     }
 
@@ -1899,6 +1917,11 @@ private:
             case 2:
                 controls.set(controls::AfRange, controls::AfRangeFull);
                 break;
+        }
+
+        // Merge FPS controls (FrameDurationLimits) into the controls
+        if (!fps_controls_.empty()) {
+            controls.merge(fps_controls_);
         }
 
         return controls;
