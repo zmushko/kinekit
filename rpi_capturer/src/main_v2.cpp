@@ -382,7 +382,7 @@ private:
 
     // Frame dimensions
     int full_width_, full_height_;      // 1920x1080
-    int sample_width_, sample_height_;  // 480x270 (каждая 4-я строка/столбец)
+    int sample_width_, sample_height_;  // 480x270 (each 4th line/column)
 
     // Detection parameters
     float threshold_ = 25.0f;           // Pixel difference threshold
@@ -457,6 +457,43 @@ public:
         return motion_detected_;
     }
 
+    bool detectMotion(unsigned char* y_data, size_t y_size) {
+        // Reset statistics
+        motion_pixel_count_ = 0;
+        motion_detected_ = false;
+
+        // Skip first frame (no previous frame to compare)
+        if (first_frame_) {
+            downsampleYFrame(y_data, prev_y_frame_.data());
+            first_frame_ = false;
+            return false;
+        }
+
+        // Downsample current frame
+        std::vector<unsigned char> current_frame(sample_width_ * sample_height_);
+        downsampleYFrame(y_data, current_frame.data());
+
+        // Compare with previous frame using NEON if available
+        int total_pixels = sample_width_ * sample_height_;
+
+#ifdef __ARM_NEON
+        motion_pixel_count_ = compareFramesNEON(current_frame.data(), prev_y_frame_.data(), total_pixels);
+#else
+        motion_pixel_count_ = compareFramesScalar(current_frame.data(), prev_y_frame_.data(), total_pixels);
+#endif
+
+        // Calculate motion level as percentage
+        last_motion_level_ = (float)motion_pixel_count_ / total_pixels * 100.0f;
+
+        // Detect motion if threshold exceeded
+        motion_detected_ = last_motion_level_ > (motion_area_threshold_ * 100.0f);
+
+        // Store current frame as previous for next iteration
+        prev_y_frame_ = std::move(current_frame);
+
+        return motion_detected_;
+    }
+
     // Configuration methods
     void setThreshold(float threshold) { threshold_ = threshold; }
     void setMotionAreaThreshold(float area_threshold) { motion_area_threshold_ = area_threshold; }
@@ -472,6 +509,12 @@ public:
     float getMotionLevel() const { return last_motion_level_; }
     int getMotionPixelCount() const { return motion_pixel_count_; }
     bool isMotionDetected() const { return motion_detected_; }
+
+    // Reset method for FPS switching
+    void resetDetectionState() {
+        first_frame_ = true;
+        std::cout << "[MotionDetector] Detection state reset due to FPS change" << std::endl;
+    }
 
 private:
     void downsampleYFrame(unsigned char* full_frame, unsigned char* sampled_frame) {
@@ -1209,7 +1252,7 @@ public:
         memset(&mode_ctrl, 0, sizeof(mode_ctrl));
 
         mode_ctrl.id = 0x009909ce;  // video_bitrate_mode
-        mode_ctrl.value = cbr ? 1 : 0;  // 0=VBR, 1=CBR
+        mode_ctrl.value = cbr ? 1 : 0;  // 0=VBR, 1=CBR 
 
         mode_ctrls.count = 1;
         mode_ctrls.controls = &mode_ctrl;
@@ -1364,13 +1407,25 @@ private:
     bool capture_running_ = false;
 
     // Frame rate settings
-    int target_fps_ = 30;  // Default 30 FPS
+    int active_fps_ = 30;      // FPS for active mode (motion detected)
+    int static_fps_ = 3;       // FPS for static mode (no motion)
+    int current_fps_ = 30;     // Current FPS setting
     std::chrono::steady_clock::time_point last_frame_time_;
     bool static_mode_ = false; // If true, disable motion detection and capture continuously
+    ControlList fps_controls_;  // Storage for FrameDurationLimits controls
 
     // Motion detection frame skip control
     int motion_frame_skip_ = 1;        // Process every N-th frame (1 = every frame)
     int motion_frame_counter_ = 0;     // Current frame counter
+
+    // FPS change handling
+    bool fps_changing_ = false;        // Flag indicating FPS is changing
+    int fps_change_frame_count_ = 0;   // Frames processed since FPS change
+    static const int FPS_STABILIZATION_FRAMES = 6; // Wait N frames before resetting motion detector
+
+    // Camera resolution settings
+    int width_ = 1920;
+    int height_ = 1080;
 
     // Autofocus settings
     struct AutofocusSettings {
@@ -1398,14 +1453,16 @@ public:
         : cm_(std::make_unique<CameraManager>()),
           mjpeg_handler_(std::move(mjpeg_handler)),
           h264_handler_(std::move(h264_handler)),
-          last_motion_time_(std::chrono::steady_clock::now()) {
+          last_motion_time_(std::chrono::steady_clock::now()),
+          width_(width),
+          height_(height) {
 
         // Initialize encoders
-        jpeg_encoder_ = std::make_unique<JpegEncoder>(width, height, 90); // Quality=90
-        h264_encoder_ = std::make_unique<H264Encoder>(width, height, 60, 5000000); // GOP=60, Bitrate=5Mbps
+        jpeg_encoder_ = std::make_unique<JpegEncoder>(width_, height_, 90); // Quality=90
+        h264_encoder_ = std::make_unique<H264Encoder>(width_, height_, 60, 5000000); // GOP=60, Bitrate=5Mbps
 
         // Initialize motion detector
-        motion_detector_ = std::make_unique<MotionDetector>(width, height, 4); // Downsample factor 4
+        motion_detector_ = std::make_unique<MotionDetector>(width_, height_, 4); // Downsample factor 4
     }
     
     bool initialize() {
@@ -1457,7 +1514,7 @@ public:
         
         // Configure parameters for Zero 2W + Camera v3
         StreamConfiguration &stream_config = config_->at(0);
-        stream_config.size = Size(1920, 1080);  // Full HD
+        stream_config.size = Size(width_, height_);  // Use configured resolution
         stream_config.pixelFormat = formats::YUV420; // Efficient format
         
         // Validate configuration
@@ -1511,8 +1568,8 @@ public:
                 return false;
             }
 
-            ControlList af_controls = buildAutofocusControls();
-            request->controls() = af_controls;
+            ControlList controls = buildControls();
+            request->controls() = controls;
 
             requests_.push_back(std::move(request));
         }
@@ -1540,7 +1597,7 @@ public:
             }
         }
         
-        std::cout << "Capture started at " << target_fps_ << " FPS!" << std::endl;
+        std::cout << "Capture started at " << current_fps_ << " FPS!" << std::endl;
         return true;
     }
     
@@ -1571,25 +1628,20 @@ public:
     virtual void processingFrameBuffer(const FrameBuffer *buffer) {
         bool h264_sent = false;
 
-        // Calculate total YUV size and store individual plane sizes
-        size_t total_yuv_size = 0;
-        std::vector<size_t> plane_sizes;
-        for (const auto &plane : buffer->planes()) {
-            plane_sizes.push_back(plane.length);
-            total_yuv_size += plane.length;
-        }
+        size_t total_yuv_size = width_ * height_ * 3 / 2;
+        void *mapped_data = mmap(nullptr, total_yuv_size, PROT_READ, MAP_SHARED, buffer->planes()[0].fd.get(), 0);
         const FrameBuffer::Plane &first_plane = buffer->planes()[0];
 
         // Motion detection BEFORE encoding (using Y plane only)
         bool should_record = true;
-        if (motion_detector_ && plane_sizes.size() >= 1) {
+        if (motion_detector_ && first_plane.length >= 0) {
             // Frame skipping optimization - only process every N-th frame
             motion_frame_counter_++;
             bool should_detect = static_mode_ ? true : (motion_frame_counter_ % motion_frame_skip_ == 0);
 
             bool motion = false;
             if (should_detect) {
-                motion = motion_detector_->detectMotion(first_plane.fd.get(), total_yuv_size, plane_sizes[0]);
+                motion = motion_detector_->detectMotion(static_cast<unsigned char*>(mapped_data), first_plane.length);
             } else {
                 // Use last known motion state when skipping frames
                 motion = motion_detector_->isMotionDetected();
@@ -1598,6 +1650,15 @@ public:
             if (motion) {
                 // Update last motion time
                 last_motion_time_ = std::chrono::steady_clock::now();
+
+                // Auto-switch to high FPS when motion detected (only on state change)
+                /*if (static_mode_) {
+                    setFrameRate(active_fps_);  // Switch to active FPS (30 FPS)
+                    std::cout << "[AUTO-FPS] Motion detected! Switched to " << active_fps_ << " FPS" << std::endl;
+                    static_mode_ = false;  // Exit static mode immediately
+                }*/
+                // current_fps_ = active_fps_;
+
                 std::cout << "[MOTION] Detected! Level: " << std::fixed << std::setprecision(2)
                           << motion_detector_->getMotionLevel() << "%, Pixels: "
                           << motion_detector_->getMotionPixelCount() << std::endl;
@@ -1611,6 +1672,14 @@ public:
                     // std::cout << "[MOTION] No motion for " << time_since_motion.count()
                     //           << "s, skipping frame" << std::endl;
                     should_record = false;
+                    // current_fps_ = static_fps_;
+
+                    // Auto-switch to low FPS when entering static mode (only on state change)
+                    /*if (!static_mode_) {
+                        setFrameRate(static_fps_);  // Switch to static FPS (1 FPS)
+                        std::cout << "[AUTO-FPS] Entering static mode. Switched to " << static_fps_ << " FPS" << std::endl;
+                        static_mode_ = true;  // Enter static mode
+                    }*/
                 } else {
                     // Still in tail recording period
                     // std::cout << "[MOTION] Tail recording (" << time_since_motion.count()
@@ -1620,71 +1689,43 @@ public:
         }
 
         // Skip encoding if motion-based recording is disabled
-        if (!should_record) {
-            // int acting_fps = target_fps_;
-            // if (static_mode_) {
-            //     acting_fps = std::max(1, target_fps_ / motion_frame_skip_);
-            // }
-
-            static_mode_ = true; // Switch to static mode if no motion
-            return;
-        }
-        static_mode_ = false; // Reset static mode if capturing
+        // if (!should_record) {
+        //     if (!static_mode_) {
+        //         std::cout << "[MOTION] Entering static mode." << std::endl;
+        //         // current_fps_ = static_fps_;
+        //         static_mode_ = true;  // Enter static mode
+        //     }
+        //     // sleep for frame duration to maintain timing
+        //     // std::this_thread::sleep_for(std::chrono::milliseconds(1000 / (int)(current_fps_/motion_frame_skip_) - 50));
+        //     munmap(mapped_data, total_yuv_size);
+        //     return;
+        // }
+        // if (static_mode_) {
+        //     std::cout << "[MOTION] Exiting static mode." << std::endl;
+        //     // current_fps_ = active_fps_;
+        //     static_mode_ = false;  // Exit static mode
+        // }
 
         // Try H.264 encoding and output if enabled
         if (use_h264_output_ && use_h264_ && h264_encoder_) {
             std::vector<unsigned char> h264_data;
 
-            if (h264_encoder_->encodeDMA(first_plane.fd.get(), 0, total_yuv_size, h264_data)) {
+            if (h264_encoder_->encodeDMA(first_plane.fd.get(), 0, total_yuv_size, h264_data)) {                
                 h264_handler_(h264_data);
                 h264_sent = true;
-
-                // If only H.264 output is enabled, return early
-                if (!use_mjpeg_) {
-                    return;
-                }
             } else {
                 std::cout << "H.264 DMA encoding failed" << std::endl;
             }
         }
 
         // JPEG encoding and output if enabled
-        if (use_mjpeg_) {
-            void *mapped_data = g_buffer_pool.getMapping(first_plane.fd.get(), total_yuv_size, "MJPEG");
-            if (!mapped_data) {
-                std::cerr << "JPEG: Failed to get buffer mapping" << std::endl;
-                if (!h264_sent) {
-                    std::cerr << "No frame output - both H.264 and JPEG failed" << std::endl;
-                }
-            } else {
-                std::vector<unsigned char> jpeg_data;
-                unsigned char* yuv_data = static_cast<unsigned char*>(mapped_data);
-
-                if (jpeg_encoder_->encode(yuv_data, total_yuv_size, jpeg_data)) {
-                    mjpeg_handler_(jpeg_data);
-                } else {
-                    std::cerr << "JPEG encoding error" << std::endl;
-                    if (!h264_sent) {
-                        std::cerr << "No frame output - both H.264 and JPEG failed" << std::endl;
-                    }
-                }
-                // No munmap needed - SharedBufferPool manages this automatically!
+        if (use_mjpeg_ && should_record) {
+            std::vector<unsigned char> jpeg_data;
+            if (jpeg_encoder_->encode(static_cast<unsigned char*>(mapped_data), total_yuv_size, jpeg_data)) {
+                mjpeg_handler_(jpeg_data);
             }
         }
-
-        // Calculate frame interval for target FPS
-        auto frame_interval = std::chrono::microseconds(1000000 / target_fps_);
-        auto now = std::chrono::steady_clock::now();
-
-        if (frames_captured_ > 1 && target_fps_ < 30) {  // Skip timing for first frame
-            auto elapsed = now - last_frame_time_;
-            if (elapsed < frame_interval) {
-                auto sleep_time = frame_interval - elapsed;
-                std::this_thread::sleep_for(sleep_time);
-            }
-        }
-
-        last_frame_time_ = std::chrono::steady_clock::now();
+        munmap(mapped_data, total_yuv_size);
     }
 
     virtual void requestComplete(Request *req) {
@@ -1704,8 +1745,8 @@ public:
             if (capture_running_) {
                 req->reuse(Request::ReuseBuffers);
 
-                ControlList af_controls = buildAutofocusControls();
-                req->controls() = af_controls;
+                ControlList controls = buildControls();
+                req->controls() = controls;
 
                 camera_->queueRequest(req);
             }
@@ -1745,7 +1786,6 @@ public:
         af_settings_.range = range;
     }
 
-
     void enableH264Encoding(bool enable) {
         use_h264_ = enable && h264_encoder_;
     }
@@ -1775,7 +1815,7 @@ public:
     // Motion detection methods
     void enableMotionDetection(bool enable) {
         if (enable && !motion_detector_) {
-            motion_detector_ = std::make_unique<MotionDetector>(1920, 1080, 4);
+            motion_detector_ = std::make_unique<MotionDetector>(width_, height_, 4);
         } else if (!enable) {
             motion_detector_.reset();
         }
@@ -1845,18 +1885,45 @@ public:
             std::cerr << "Invalid FPS value: " << fps << ". Must be between 1 and 120." << std::endl;
             return false;
         }
-        target_fps_ = fps;
-        int64_t frame_duration_ns = 1000000000 / fps;
-        std::cout << "Target frame rate set to " << fps << " FPS (duration: " << frame_duration_ns << " ns)" << std::endl;
+        current_fps_ = fps;
+
+        // // Use rpicam-apps approach: set FrameDurationLimits for hardware-level FPS control
+        // int64_t frame_time_us = 1000000 / fps;  // в микросекундах
+
+        // try {
+        //     ControlList controls;
+        //     controls.set(controls::FrameDurationLimits,
+        //                 libcamera::Span<const int64_t, 2>({ frame_time_us, frame_time_us }));
+
+        //     // Apply to camera if it's already configured
+        //     if (camera_ && capture_running_) {
+        //         // Will be applied to next requests automatically via buildAutofocusControls()
+        //         std::cout << "FrameDurationLimits set to " << frame_time_us << " us (" << fps << " FPS)" << std::endl;
+        //     }
+
+        //     // Store for future requests
+        //     fps_controls_ = controls;
+
+        // } catch (const std::exception& e) {
+        //     std::cerr << "Failed to set FrameDurationLimits: " << e.what() << std::endl;
+        //     return false;
+        // }
+
+        // // Reset motion detector state to prevent false detections after FPS change
+        // if (motion_detector_) {
+        //     motion_detector_->resetDetectionState();
+        // }
+
+        // std::cout << "Target frame rate set to " << fps << " FPS using hardware FrameDurationLimits" << std::endl;
         return true;
     }
 
     int getFrameRate() const {
-        return target_fps_;
+        return current_fps_;
     }
 
 private:
-    ControlList buildAutofocusControls() {
+    ControlList buildControls() {
         ControlList controls;
 
         if (!af_settings_.enable) {
@@ -1901,6 +1968,15 @@ private:
                 break;
         }
 
+        static bool first_time = true;
+        if (first_time) {
+            std::cout << "Initial FPS set to " << current_fps_ << " FPS" << std::endl;
+            first_time = false;
+            int64_t frame_time_us = 1000000 / current_fps_;
+            controls.set(controls::FrameDurationLimits,
+                        libcamera::Span<const int64_t, 2>({ frame_time_us, frame_time_us }));
+        }
+
         return controls;
     }
 
@@ -1924,229 +2000,6 @@ public:
     }
 };
 
-// Smart streaming wrapper with policy-based streaming decisions
-template<typename MjpegHandler, typename H264Handler, typename StreamingPolicy = AlwaysStreamPolicy>
-class SmartCapturerV2 : public CapturerV2<MjpegHandler, H264Handler> {
-private:
-    StreamingPolicy streaming_policy_;
-    std::chrono::steady_clock::time_point last_motion_time_;
-    std::chrono::steady_clock::time_point last_af_stable_time_;
-
-    // AF state monitoring (moved from base class)
-    int current_af_state_ = -1;        // Current AF state (-1 = unknown)
-    bool af_locked_ = false;           // True when AF is locked/focused
-    std::chrono::steady_clock::time_point af_last_change_;  // When AF state last changed
-    int af_scan_count_ = 0;            // Count of AF scan cycles
-
-public:
-    SmartCapturerV2(MjpegHandler mjpeg_handler, H264Handler h264_handler, int width = 1920, int height = 1080)
-        : CapturerV2<MjpegHandler, H264Handler>(std::move(mjpeg_handler), std::move(h264_handler), width, height),
-          last_motion_time_(std::chrono::steady_clock::now()),
-          last_af_stable_time_(std::chrono::steady_clock::now()) {
-
-        std::cout << "SmartCapturerV2 initialized with streaming policy" << std::endl;
-    }
-
-    // Override requestComplete to add AF monitoring
-    void requestComplete(Request *req) override {
-        if (req->status() == Request::RequestComplete) {
-            // AF monitoring first
-            monitorAutofocusState(req);
-
-            // Call base class implementation
-            CapturerV2<MjpegHandler, H264Handler>::requestComplete(req);
-        } else {
-            std::cerr << "Frame capture error" << std::endl;
-        }
-    }
-
-protected:
-    // Override frame processing to add smart streaming logic
-    void processingFrameBuffer(const FrameBuffer *buffer) override {
-        if (!buffer) return;
-
-        // Calculate total YUV size (sum of all planes)
-        size_t total_yuv_size = 0;
-        std::vector<size_t> plane_sizes;
-        for (const auto &plane : buffer->planes()) {
-            plane_sizes.push_back(plane.length);
-            total_yuv_size += plane.length;
-        }
-        const FrameBuffer::Plane &first_plane = buffer->planes()[0];
-
-        // Motion detection (always run for scene analysis)
-        if (this->getMotionDetector()) {
-            this->getMotionDetector()->detectMotion(first_plane.fd.get(), total_yuv_size, plane_sizes[0]);
-        }
-
-        // Analyze current scene state
-        SceneAnalysis scene = analyzeScene(first_plane, total_yuv_size);
-
-        // Make streaming decisions based on policy
-        bool should_encode_h264 = streaming_policy_.shouldEncodeH264(scene);
-        bool should_encode_mjpeg = streaming_policy_.shouldEncodeMJPEG(scene);
-        bool h264_sent = false;
-
-        // H.264 encoding if enabled and decided by policy
-        if (this->isH264OutputEnabled() && should_encode_h264) {
-            std::vector<unsigned char> h264_data;
-            if (this->getH264Encoder() && this->getH264Encoder()->encodeDMA(first_plane.fd.get(), 0, total_yuv_size, h264_data)) {
-                this->getH264Handler()(h264_data);
-                streaming_policy_.onFrameEncoded(h264_data, true);
-                h264_sent = true;
-            }
-        }
-
-        // MJPEG encoding if enabled and decided by policy
-        if (this->isMjpegEnabled() && should_encode_mjpeg) {
-            void *mapped_data = g_buffer_pool.getMapping(first_plane.fd.get(), total_yuv_size, "SmartMJPEG");
-            if (mapped_data) {
-                std::vector<unsigned char> jpeg_data;
-                unsigned char* yuv_data = static_cast<unsigned char*>(mapped_data);
-
-                if (this->getJpegEncoder()->encode(yuv_data, total_yuv_size, jpeg_data)) {
-                    this->getMjpegHandler()(jpeg_data);
-                    streaming_policy_.onFrameEncoded(jpeg_data, false);
-                } else {
-                    std::cerr << "Smart JPEG encoding error" << std::endl;
-                }
-            }
-        }
-
-        // Send cached frames if policy decides not to encode
-        if (!should_encode_h264 || !should_encode_mjpeg) {
-            streaming_policy_.sendCachedFrame(this->getH264Handler(), this->getMjpegHandler());
-        }
-    }
-
-    // Monitor autofocus state from request metadata (moved from base class)
-    void monitorAutofocusState(Request *req) {
-        const auto& metadata = req->metadata();
-
-        // Check if AF state is available in metadata
-        if (metadata.contains(controls::AfState.id())) {
-            auto af_state_opt = metadata.get(controls::AfState);
-            if (!af_state_opt) return;
-            int new_af_state = *af_state_opt;
-
-            // AF state changed?
-            if (new_af_state != current_af_state_) {
-                auto now = std::chrono::steady_clock::now();
-
-                // Log state change
-                const char* state_names[] = {"Idle", "Scanning", "Focused", "Failed"};
-                const char* old_name = (current_af_state_ >= 0 && current_af_state_ <= 3) ?
-                                       state_names[current_af_state_] : "Unknown";
-                const char* new_name = (new_af_state >= 0 && new_af_state <= 3) ?
-                                       state_names[new_af_state] : "Unknown";
-
-                std::cout << "AF state: " << old_name << " -> " << new_name << std::endl;
-
-                // Update state tracking
-                current_af_state_ = new_af_state;
-                af_last_change_ = now;
-
-                // Check for specific state transitions
-                if (new_af_state == 1) {  // Scanning
-                    af_scan_count_++;
-                    af_locked_ = false;
-                    std::cout << "AF scanning... (cycle #" << af_scan_count_ << ")" << std::endl;
-                } else if (new_af_state == 2) {  // Focused
-                    af_locked_ = true;
-                    std::cout << "AF LOCKED! Focus achieved after " << af_scan_count_
-                              << " scan cycles" << std::endl;
-                } else if (new_af_state == 3) {  // Failed
-                    af_locked_ = false;
-                    std::cout << "AF failed to find focus" << std::endl;
-                } else if (new_af_state == 0) {  // Idle
-                    af_locked_ = false;
-                }
-            }
-        }
-
-        // Also check lens position if available
-        if (metadata.contains(controls::LensPosition.id())) {
-            auto lens_pos_opt = metadata.get(controls::LensPosition);
-            if (!lens_pos_opt) return;
-            float lens_pos = *lens_pos_opt;
-            // Only log significant lens movements to avoid spam
-            static float last_logged_pos = -999.0f;
-            if (std::abs(lens_pos - last_logged_pos) > 0.1f) {
-                std::cout << "Lens position: " << std::fixed << std::setprecision(2)
-                          << lens_pos << std::endl;
-                last_logged_pos = lens_pos;
-            }
-        }
-    }
-
-private:
-    SceneAnalysis analyzeScene(const FrameBuffer::Plane &plane, size_t total_size) {
-        SceneAnalysis scene;
-        auto now = std::chrono::steady_clock::now();
-
-        // Motion analysis
-        if (this->getMotionDetector()) {
-            scene.motion_detected = this->getMotionDetector()->isMotionDetected();
-            scene.motion_level = this->getMotionDetector()->getMotionLevel();
-
-            if (scene.motion_detected) {
-                last_motion_time_ = now;
-            }
-            scene.since_last_motion = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_motion_time_);
-        }
-
-        // AF stability analysis
-        scene.af_stable = isAutofocusStable();
-        if (scene.af_stable) {
-            last_af_stable_time_ = now;
-        }
-        scene.since_af_stable = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_af_stable_time_);
-
-        // Remove per-frame logging to reduce spam
-
-        return scene;
-    }
-
-    // AF state monitoring methods (moved from base class)
-    bool isAutofocusLocked() const {
-        return af_locked_;
-    }
-
-    int getAutofocusState() const {
-        return current_af_state_;
-    }
-
-    const char* getAutofocusStateName() const {
-        const char* state_names[] = {"Idle", "Scanning", "Focused", "Failed"};
-        if (current_af_state_ >= 0 && current_af_state_ <= 3) {
-            return state_names[current_af_state_];
-        }
-        return "Unknown";
-    }
-
-    int getAutofocusScanCount() const {
-        return af_scan_count_;
-    }
-
-    // Check if AF has been stable (locked) for specified duration
-    bool isAutofocusStable(std::chrono::milliseconds duration = std::chrono::milliseconds(500)) const {
-        if (!af_locked_) return false;
-        auto now = std::chrono::steady_clock::now();
-        auto time_since_change = std::chrono::duration_cast<std::chrono::milliseconds>(now - af_last_change_);
-        return time_since_change >= duration;
-    }
-
-public:
-    // Access to streaming policy for configuration
-    StreamingPolicy& getStreamingPolicy() {
-        return streaming_policy_;
-    }
-
-    const StreamingPolicy& getStreamingPolicy() const {
-        return streaming_policy_;
-    }
-};
-
 int main(int argc, char *argv[]) {
     std::cout << "Camera Module v3 + Pi Zero 2W + libcamera" << std::endl;
 
@@ -2164,21 +2017,7 @@ int main(int argc, char *argv[]) {
         H264FrameHandler<TcpSender> h264_handler(std::move(tcp_sender_h264));
 
         // Regular capturer (always encoding)
-        CapturerV2 capturer(std::move(mjpeg_handler), std::move(h264_handler));
-
-        // Smart streaming alternatives (uncomment to use):
-        //
-        // Option 1: Motion-triggered streaming
-        // SmartCapturerV2<MjpegFrameHandler<TcpSender>, H264FrameHandler<TcpSender>, MotionStreamPolicy>
-        //     capturer(std::move(mjpeg_handler), std::move(h264_handler));
-        //
-        // Option 2: Hybrid intelligent streaming
-        // SmartCapturerV2<MjpegFrameHandler<TcpSender>, H264FrameHandler<TcpSender>, HybridStreamPolicy>
-        //     capturer(std::move(mjpeg_handler), std::move(h264_handler));
-        //
-        // Option 3: Always stream (same as regular CapturerV2)
-        // SmartCapturerV2<MjpegFrameHandler<TcpSender>, H264FrameHandler<TcpSender>, AlwaysStreamPolicy>
-        //     capturer(std::move(mjpeg_handler), std::move(h264_handler));
+        CapturerV2 capturer(std::move(mjpeg_handler), std::move(h264_handler), 1920, 1080);
 
         if (!capturer.initialize()) {
             return -1;
@@ -2193,37 +2032,26 @@ int main(int argc, char *argv[]) {
         }
 
         capturer.setAutofocusMode(2);  // 0=Auto, 1=Manual, 2=Continuous
-        capturer.setAutofocusSpeed(0); // 0=Normal, 1=Fast
-        capturer.setAutofocusRange(1); // 0=Normal, 1=Macro, 2=Full
+        capturer.setAutofocusSpeed(1); // 0=Normal, 1=Fast
+        capturer.setAutofocusRange(2); // 0=Normal, 1=Macro, 2=Full
         capturer.enableAutofocus(true);
         capturer.setFrameRate(30);  // 30 FPS
         capturer.enableMotionDetection(true); // Enable motion detection by default
-        capturer.setMotionFrameSkip(30); // Process every 30th frame
-        capturer.setMotionTailDuration(3); // Record for 3 seconds after motion stops
+        capturer.setMotionFrameSkip(10); // Process every 30th frame
+        capturer.setMotionTailDuration(10); // Record for 3 seconds after motion stops
 
 
         if (capturer.isH264Available()) {
             std::cout << "H.264 hardware encoder detected!" << std::endl;
             capturer.enableH264Encoding(true);
             capturer.setH264GopSize(60);  // 1 I-frame every 60 frames
-            capturer.setH264Bitrate(5000000, false);  // 5Mbps
+            capturer.setH264Bitrate(5000000, false);  // 5Mbps VBR = false, CBR = true
         } else {
             std::cout << "H.264 hardware encoder not available, using JPEG only" << std::endl;
         }
 
-        // Configure output formats - you can choose which formats to enable:
-
-        // Option 1: Only MJPEG output (port 9998)
         capturer.enableMjpegOutput(false);
         capturer.enableH264Output(true);
-
-        // Option 2: Only H.264 output (port 9999) - uncomment to use
-        // capturer.enableMjpegOutput(false);
-        // capturer.enableH264Output(true);
-
-        // Option 3: Both outputs (MJPEG to port 9998, H.264 to port 9999) - uncomment to use
-        // capturer.enableMjpegOutput(true);
-        // capturer.enableH264Output(true);
 
         if (!capturer.startCapture()) {
             return -1;
