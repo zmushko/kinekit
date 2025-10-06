@@ -648,7 +648,7 @@ private:
 
 public:
     // Zero-copy encoding using DMA file descriptor
-    bool encodeDMA(int dma_fd, std::vector<unsigned char>& h264_data) {
+    bool encodeDMA(int dma_fd, std::vector<unsigned char>& h264_data, bool& is_keyframe) {
         if (!initialized_) {
             std::cerr << "H.264 encoder not initialized" << std::endl;
             return false;
@@ -720,10 +720,8 @@ public:
             return false;
         }
 
-        bool is_keyframe = !!(output_buf.flags & V4L2_BUF_FLAG_KEYFRAME);
-        if (is_keyframe) {
-            std::cout << "IDR frame detected!" << std::endl;
-        }
+        // Detect keyframe (IDR frame)
+        is_keyframe = !!(output_buf.flags & V4L2_BUF_FLAG_KEYFRAME);
 
         // Copy H.264 data from pre-mapped output buffer
         size_t h264_size = output_planes[0].bytesused;
@@ -928,10 +926,15 @@ private:
     std::thread accept_thread_;        // Thread for accepting new client connections
     bool first_frame_;                 // Track first frame for initial burst transmission
 
+    // Keyframe caching for new clients
+    std::vector<unsigned char> cached_keyframe_;  // Cached IDR frame (includes SPS/PPS if inline_headers enabled)
+    mutable std::mutex keyframe_mutex_;           // Mutex to protect keyframe cache
+    bool has_keyframe_;                           // Do we have a cached keyframe?
+
 public:
     TcpBroadcaster(int server_port, int max_clients = 5)
         : server_fd_(-1), server_port_(server_port), max_clients_(max_clients),
-          running_(false), first_frame_(true) {
+          running_(false), first_frame_(true), has_keyframe_(false) {
 
         // Create server socket
         server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -999,7 +1002,14 @@ public:
     }
 
     // Send data to all connected clients
-    void send(const std::vector<unsigned char>& data) {
+    void send(const std::vector<unsigned char>& data, bool is_keyframe = false) {
+        // Cache keyframe for new clients (contains SPS/PPS + IDR if inline_headers enabled)
+        if (is_keyframe) {
+            std::lock_guard<std::mutex> kf_lock(keyframe_mutex_);
+            cached_keyframe_ = data;
+            has_keyframe_ = true;
+        }
+
         std::lock_guard<std::mutex> lock(clients_mutex_);
 
         // No clients connected - skip transmission
@@ -1034,7 +1044,6 @@ public:
                         failed = true;
                         break;
                     }
-                    std::cout << "Sent " << sent << " bytes to client fd=" << client_fd << std::endl;
                     total_sent += sent;
                 }
 
@@ -1111,6 +1120,34 @@ private:
                 std::cout << "Client connected from " << client_ip
                          << " (fd=" << client_fd << ", total clients: "
                          << client_sockets_.size() << "/" << max_clients_ << ")" << std::endl;
+
+                // Send cached keyframe to new client IMMEDIATELY (3 times for reliability)
+                // This allows the client to start decoding right away
+                {
+                    std::lock_guard<std::mutex> kf_lock(keyframe_mutex_);
+                    if (has_keyframe_) {
+                        for (int i = 0; i < 3; i++) {
+                            ssize_t total_sent = 0;
+                            ssize_t data_size = cached_keyframe_.size();
+
+                            while (total_sent < data_size) {
+                                ssize_t sent = ::send(client_fd, cached_keyframe_.data() + total_sent,
+                                                     data_size - total_sent, MSG_NOSIGNAL);
+                                if (sent < 0) {
+                                    std::cerr << "Failed to send cached keyframe to new client (attempt "
+                                             << (i+1) << ")" << std::endl;
+                                    break;
+                                }
+                                total_sent += sent;
+                            }
+
+                            if (total_sent == data_size) {
+                                std::cout << "Sent cached keyframe to new client (attempt " << (i+1)
+                                         << ", " << cached_keyframe_.size() << " bytes)" << std::endl;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1127,9 +1164,9 @@ public:
         broadcaster_ = std::make_unique<TcpBroadcaster>(server_port, max_clients);
     }
 
-    void send(const std::vector<unsigned char>& data) {
+    void send(const std::vector<unsigned char>& data, bool is_keyframe = false) {
         if (broadcaster_) {
-            broadcaster_->send(data);
+            broadcaster_->send(data, is_keyframe);
         }
     }
 };
@@ -1144,7 +1181,10 @@ public:
     TelegramSender(const std::string& token, const std::string& chat_id)
         : bot_token_(token), chat_id_(chat_id) {}
 
-    void send(const std::vector<unsigned char>& data) {
+    void send(const std::vector<unsigned char>& data, bool is_keyframe = false) {
+        // Throttling is now handled in CapturerV2::processingFrameBuffer (before JPEG encoding)
+        // This saves CPU by not encoding frames that won't be sent
+
         // Implement Telegram API call to send 'data' to 'chat_id_' using 'bot_token_'
         std::cout << "Sending frame " << frame_counter_++ << " to Telegram chat " << chat_id_ << std::endl;
         std::string filename = "./frame_" + std::to_string(frame_counter_) + ".jpg";
@@ -1167,7 +1207,9 @@ public:
         std::cout << "TCP sender initialized successfully" << std::endl;
     }
 
-    void send(const std::vector<unsigned char>& data) {
+    void send(const std::vector<unsigned char>& data, bool is_keyframe = false) {
+        // Note: is_keyframe is ignored for TcpSender (client mode)
+        // Keyframe caching is only used in TcpBroadcaster (server mode)
         bool success = tcp_client_->sendData(data);
         if (!success) {
             std::cerr << "Failed to send data via TCP" << std::endl;
@@ -1198,7 +1240,8 @@ public:
     FileSender(const std::string& path, const std::string& ext = ".dat")
         : base_path_(path), extension_(ext) {}
 
-    void send(const std::vector<unsigned char>& data) {
+    void send(const std::vector<unsigned char>& data, bool is_keyframe = false) {
+        // Note: is_keyframe can be used to save only keyframes if desired
         std::string filename = base_path_ + "/frame_" + std::to_string(frame_counter_++) + extension_;
         std::ofstream file(filename, std::ios::binary);
         file.write(reinterpret_cast<const char*>(data.data()), data.size());
@@ -1227,8 +1270,8 @@ private:
 public:
     explicit H264FrameHandler(Sender sender) : sender_(std::move(sender)) {}
 
-    void operator()(const std::vector<unsigned char>& h264_data) {
-        sender_.send(h264_data);
+    void operator()(const std::vector<unsigned char>& h264_data, bool is_keyframe = false) {
+        sender_.send(h264_data, is_keyframe);
     }
 };
 
@@ -1273,6 +1316,10 @@ private:
     int motion_frame_skip_ = 1;        // Process every N-th frame (1 = every frame)
     int motion_frame_counter_ = 0;     // Current frame counter
 
+    // JPEG encoding throttle (for Telegram sender)
+    std::chrono::steady_clock::time_point last_jpeg_encode_time_;
+    std::chrono::milliseconds jpeg_encode_interval_{300};  // Minimum 300ms between JPEG encodes
+
     // Camera resolution settings
     int width_ = 1920;
     int height_ = 1080;
@@ -1294,6 +1341,7 @@ public:
           mjpeg_handler_(std::move(mjpeg_handler)),
           h264_handler_(std::move(h264_handler)),
           last_motion_time_(std::chrono::steady_clock::now()),
+          last_jpeg_encode_time_(std::chrono::steady_clock::now()),
           width_(width),
           height_(height) {
 
@@ -1508,19 +1556,27 @@ public:
         // Try H.264 encoding and output if enabled
         if (use_h264_output_ && use_h264_ && h264_encoder_) {
             std::vector<unsigned char> h264_data;
+            bool is_keyframe = false;
 
-            if (h264_encoder_->encodeDMA(first_plane.fd.get(), h264_data)) {                
-                h264_handler_(h264_data);
+            if (h264_encoder_->encodeDMA(first_plane.fd.get(), h264_data, is_keyframe)) {
+                h264_handler_(h264_data, is_keyframe);
             } else {
                 std::cout << "H.264 DMA encoding failed" << std::endl;
             }
         }
 
-        // JPEG encoding and output if enabled
+        // JPEG encoding and output if enabled (with 300ms throttle to save CPU)
         if (use_mjpeg_ && should_record) {
-            std::vector<unsigned char> jpeg_data;
-            if (jpeg_encoder_->encode(static_cast<unsigned char*>(mapped_data), total_yuv_size, jpeg_data)) {
-                mjpeg_handler_(jpeg_data);
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_jpeg_encode_time_);
+
+            if (elapsed >= jpeg_encode_interval_) {
+                last_jpeg_encode_time_ = now;
+
+                std::vector<unsigned char> jpeg_data;
+                if (jpeg_encoder_->encode(static_cast<unsigned char*>(mapped_data), total_yuv_size, jpeg_data)) {
+                    mjpeg_handler_(jpeg_data);
+                }
             }
         }
         munmap(mapped_data, total_yuv_size);
@@ -1658,6 +1714,15 @@ public:
 
     int getMotionTailDuration() const {
         return static_cast<int>(motion_tail_duration_.count());
+    }
+
+    void setJpegEncodeInterval(int milliseconds) {
+        jpeg_encode_interval_ = std::chrono::milliseconds(milliseconds);
+        std::cout << "JPEG encode interval set to " << milliseconds << "ms" << std::endl;
+    }
+
+    int getJpegEncodeInterval() const {
+        return static_cast<int>(jpeg_encode_interval_.count());
     }
 
     bool setH264GopSize(int gop_size) {
@@ -1821,6 +1886,7 @@ int main(int argc, char *argv[]) {
         capturer.enableMotionDetection(true); // Enable motion detection by default
         capturer.setMotionFrameSkip(10); // Process every 10th frame
         capturer.setMotionTailDuration(5); // Record for 5 seconds after motion stops
+        capturer.setJpegEncodeInterval(300);  // 300ms between JPEG encodes
 
         if (capturer.isH264Available()) {
             std::cout << "H.264 hardware encoder detected!" << std::endl;
