@@ -20,6 +20,12 @@
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <curl/curl.h>
+#include <map>
+#include <string>
+#include <queue>
+#include <condition_variable>
+#include <atomic>
 
 // ARM NEON intrinsics for SIMD optimization
 #ifdef __ARM_NEON
@@ -38,6 +44,191 @@ namespace V4L2Controls {
         BITRATE = 0x009909cf             // V4L2_ID_MPEG_VIDEO_BITRATE
     };
 }
+
+// HTTP Client - wrapper around libcurl for multipart/form-data POST requests
+class HttpClient {
+public:
+    struct Response {
+        long status_code = 0;
+        std::string body;
+        bool success = false;
+    };
+
+    HttpClient() {
+        curl_global_init(CURL_GLOBAL_ALL);
+    }
+
+    ~HttpClient() {
+        curl_global_cleanup();
+    }
+
+    // Callback for writing response data
+    static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+        size_t total_size = size * nmemb;
+        std::string* response = static_cast<std::string*>(userp);
+        response->append(static_cast<char*>(contents), total_size);
+        return total_size;
+    }
+
+    // POST multipart/form-data with file
+    Response postMultipartFile(
+        const std::string& url,
+        const std::map<std::string, std::string>& fields,
+        const std::string& file_field_name,
+        const std::vector<unsigned char>& file_data,
+        const std::string& filename,
+        int timeout_ms = 10000
+    ) {
+        Response response;
+        CURL* curl = curl_easy_init();
+
+        if (!curl) {
+            std::cerr << "Failed to initialize CURL" << std::endl;
+            return response;
+        }
+
+        curl_mime* mime = curl_mime_init(curl);
+
+        // Add text fields
+        for (const auto& [key, value] : fields) {
+            curl_mimepart* part = curl_mime_addpart(mime);
+            curl_mime_name(part, key.c_str());
+            curl_mime_data(part, value.c_str(), CURL_ZERO_TERMINATED);
+        }
+
+        // Add file data
+        curl_mimepart* file_part = curl_mime_addpart(mime);
+        curl_mime_name(file_part, file_field_name.c_str());
+        curl_mime_data(file_part, reinterpret_cast<const char*>(file_data.data()), file_data.size());
+        curl_mime_filename(file_part, filename.c_str());
+        curl_mime_type(file_part, "application/octet-stream");
+
+        // Configure CURL
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+        // Perform request
+        CURLcode res = curl_easy_perform(curl);
+
+        if (res == CURLE_OK) {
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status_code);
+            response.success = (response.status_code >= 200 && response.status_code < 300);
+        } else {
+            std::cerr << "CURL error: " << curl_easy_strerror(res) << std::endl;
+            response.success = false;
+        }
+
+        // Cleanup
+        curl_mime_free(mime);
+        curl_easy_cleanup(curl);
+
+        return response;
+    }
+};
+
+// Telegram Bot API client
+class TelegramBotApi {
+private:
+    std::string bot_token_;
+    std::string base_url_;
+    HttpClient http_client_;
+
+    int max_retries_ = 3;
+    int retry_delay_ms_ = 1000;
+
+    // Send with retry logic
+    bool sendWithRetry(
+        const std::string& method,
+        const std::map<std::string, std::string>& fields,
+        const std::string& file_field,
+        const std::vector<unsigned char>& file_data,
+        const std::string& filename
+    ) {
+        for (int attempt = 0; attempt < max_retries_; ++attempt) {
+            std::string url = base_url_ + method;
+
+            auto response = http_client_.postMultipartFile(
+                url, fields, file_field, file_data, filename
+            );
+
+            if (response.success) {
+                std::cout << "Telegram API: " << method << " success (attempt "
+                         << (attempt + 1) << ")" << std::endl;
+                return true;
+            }
+
+            std::cerr << "Telegram API: " << method << " failed (attempt "
+                     << (attempt + 1) << "/" << max_retries_ << "): "
+                     << "HTTP " << response.status_code << std::endl;
+
+            if (attempt < max_retries_ - 1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms_));
+            }
+        }
+
+        std::cerr << "Telegram API: " << method << " failed after "
+                 << max_retries_ << " attempts" << std::endl;
+        return false;
+    }
+
+public:
+    TelegramBotApi(const std::string& bot_token)
+        : bot_token_(bot_token),
+          base_url_("https://api.telegram.org/bot" + bot_token + "/") {}
+
+    // Send photo (JPEG)
+    bool sendPhoto(
+        const std::string& chat_id,
+        const std::vector<unsigned char>& jpeg_data,
+        const std::string& caption = std::string()
+    ) {
+        std::map<std::string, std::string> fields;
+        fields["chat_id"] = chat_id;
+        if (!caption.empty()) {
+            fields["caption"] = caption;
+        }
+
+        return sendWithRetry("sendPhoto", fields, "photo", jpeg_data, "photo.jpg");
+    }
+
+    // Send video (MP4)
+    bool sendVideo(
+        const std::string& chat_id,
+        const std::vector<unsigned char>& mp4_data,
+        int duration = 0,
+        const std::string& caption = std::string()
+    ) {
+        std::map<std::string, std::string> fields;
+        fields["chat_id"] = chat_id;
+        if (duration > 0) {
+            fields["duration"] = std::to_string(duration);
+        }
+        if (!caption.empty()) {
+            fields["caption"] = caption;
+        }
+
+        return sendWithRetry("sendVideo", fields, "video", mp4_data, "video.mp4");
+    }
+
+    // Send animation (GIF)
+    bool sendAnimation(
+        const std::string& chat_id,
+        const std::vector<unsigned char>& gif_data,
+        const std::string& caption = std::string()
+    ) {
+        std::map<std::string, std::string> fields;
+        fields["chat_id"] = chat_id;
+        if (!caption.empty()) {
+            fields["caption"] = caption;
+        }
+
+        return sendWithRetry("sendAnimation", fields, "animation", gif_data, "animation.gif");
+    }
+};
 
 class MotionDetector {
 private:
@@ -1173,23 +1364,102 @@ public:
 
 class TelegramSender {
 private:
-    std::string bot_token_;
+    std::unique_ptr<TelegramBotApi> bot_api_;
     std::string chat_id_;
+
+    // Async queue with frame dropping
+    std::queue<std::vector<unsigned char>> frame_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::thread worker_thread_;
+    std::atomic<bool> running_{false};
+
+    size_t max_queue_size_ = 5;  // Drop oldest frames if queue grows beyond this
     int frame_counter_ = 0;
 
+    // Worker thread loop - processes frames from queue
+    void workerLoop() {
+        while (running_) {
+            std::vector<unsigned char> frame_data;
+
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                queue_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                    return !frame_queue_.empty() || !running_;
+                });
+
+                if (!running_ && frame_queue_.empty()) {
+                    break;
+                }
+
+                if (!frame_queue_.empty()) {
+                    frame_data = std::move(frame_queue_.front());
+                    frame_queue_.pop();
+                }
+            }
+
+            if (!frame_data.empty()) {
+                // Send to Telegram with retry logic
+                bool success = bot_api_->sendPhoto(chat_id_, frame_data);
+                if (success) {
+                    std::cout << "Telegram: Frame " << frame_counter_++ << " sent successfully" << std::endl;
+                } else {
+                    std::cerr << "Telegram: Failed to send frame " << frame_counter_ << std::endl;
+                }
+            }
+        }
+
+        std::cout << "Telegram worker thread stopped" << std::endl;
+    }
+
 public:
-    TelegramSender(const std::string& token, const std::string& chat_id)
-        : bot_token_(token), chat_id_(chat_id) {}
+    TelegramSender(const std::string& chat_id) : chat_id_(chat_id) {
+        // Read bot token from environment
+        const char* token = std::getenv("TELEGRAM_BOT_TOKEN");
+        if (!token) {
+            throw std::runtime_error("TELEGRAM_BOT_TOKEN environment variable not set");
+        }
+
+        bot_api_ = std::make_unique<TelegramBotApi>(token);
+        std::cout << "TelegramSender initialized (chat_id: " << chat_id_ << ")" << std::endl;
+    }
+
+    ~TelegramSender() {
+        stop();
+    }
+
+    void start() {
+        if (!running_) {
+            running_ = true;
+            worker_thread_ = std::thread(&TelegramSender::workerLoop, this);
+            std::cout << "Telegram worker thread started" << std::endl;
+        }
+    }
+
+    void stop() {
+        if (running_) {
+            running_ = false;
+            queue_cv_.notify_all();
+            if (worker_thread_.joinable()) {
+                worker_thread_.join();
+            }
+            std::cout << "Telegram sender stopped" << std::endl;
+        }
+    }
 
     void send(const std::vector<unsigned char>& data, bool is_keyframe = false) {
         // Throttling is now handled in CapturerV2::processingFrameBuffer (before JPEG encoding)
-        // This saves CPU by not encoding frames that won't be sent
 
-        // Implement Telegram API call to send 'data' to 'chat_id_' using 'bot_token_'
-        std::cout << "Sending frame " << frame_counter_++ << " to Telegram chat " << chat_id_ << std::endl;
-        std::string filename = "./frame_" + std::to_string(frame_counter_) + ".jpg";
-        std::ofstream file(filename, std::ios::binary);
-        file.write(reinterpret_cast<const char*>(data.data()), data.size());
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+
+        // Drop oldest frame if queue is full
+        if (frame_queue_.size() >= max_queue_size_) {
+            frame_queue_.pop();
+            std::cout << "Telegram: Queue full, dropped oldest frame" << std::endl;
+        }
+
+        frame_queue_.push(data);
+        queue_cv_.notify_one();
     }
 };
 
@@ -1252,26 +1522,26 @@ public:
 template<typename Sender>
 class MjpegFrameHandler {
 private:
-    Sender sender_;
+    std::shared_ptr<Sender> sender_;
 
 public:
-    explicit MjpegFrameHandler(Sender sender) : sender_(std::move(sender)) {}
+    explicit MjpegFrameHandler(std::shared_ptr<Sender> sender) : sender_(sender) {}
 
     void operator()(const std::vector<unsigned char>& mjpeg_data) {
-        sender_.send(mjpeg_data);
+        sender_->send(mjpeg_data);
     }
 };
 
 template<typename Sender>
 class H264FrameHandler {
 private:
-    Sender sender_;
+    std::shared_ptr<Sender> sender_;
 
 public:
-    explicit H264FrameHandler(Sender sender) : sender_(std::move(sender)) {}
+    explicit H264FrameHandler(std::shared_ptr<Sender> sender) : sender_(sender) {}
 
     void operator()(const std::vector<unsigned char>& h264_data, bool is_keyframe = false) {
-        sender_.send(h264_data, is_keyframe);
+        sender_->send(h264_data, is_keyframe);
     }
 };
 
@@ -1843,9 +2113,14 @@ int main(int argc, char *argv[]) {
     }
 
     try {
-        TelegramSender sender_mjpeg(std::string("argv[1]"), std::string("argv[2]")); // Use actual token and chat ID
+        // Read Telegram chat ID from environment or use default
+        const char* chat_id_env = std::getenv("TELEGRAM_CHAT_ID");
+        std::string chat_id = chat_id_env ? chat_id_env : "YOUR_CHAT_ID";
 
-        MjpegFrameHandler<TelegramSender> mjpeg_handler(std::move(sender_mjpeg));
+        auto sender_mjpeg = std::make_shared<TelegramSender>(chat_id);
+        sender_mjpeg->start();  // Start worker thread
+
+        MjpegFrameHandler<TelegramSender> mjpeg_handler(sender_mjpeg);
 
         // if (std::string(argv[1]) != "connect" && std::string(argv[1]) != "accept") {
         //     std::cerr << "Invalid mode. Use 'connect' or 'accept'." << std::endl;
@@ -1859,8 +2134,8 @@ int main(int argc, char *argv[]) {
             if (argc >= 4) {
                 max_clients = std::stoi(argv[3]);
             }
-            TcpBroadcastSender tcp_broadcaster(std::stoi(argv[2]), max_clients);
-            H264FrameHandler<TcpBroadcastSender> h264_handler(std::move(tcp_broadcaster));
+            auto tcp_broadcaster = std::make_shared<TcpBroadcastSender>(std::stoi(argv[2]), max_clients);
+            H264FrameHandler<TcpBroadcastSender> h264_handler(tcp_broadcaster);
         // }
 
         // Regular capturer (always encoding)
@@ -1885,8 +2160,8 @@ int main(int argc, char *argv[]) {
         capturer.setFrameRate(30);  // 30 FPS
         capturer.enableMotionDetection(true); // Enable motion detection by default
         capturer.setMotionFrameSkip(10); // Process every 10th frame
-        capturer.setMotionTailDuration(5); // Record for 5 seconds after motion stops
-        capturer.setJpegEncodeInterval(300);  // 300ms between JPEG encodes
+        capturer.setMotionTailDuration(1); // Record for 1 second after motion stops
+        capturer.setJpegEncodeInterval(1000);  // 1000ms between JPEG encodes
 
         if (capturer.isH264Available()) {
             std::cout << "H.264 hardware encoder detected!" << std::endl;
