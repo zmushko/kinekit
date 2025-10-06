@@ -720,6 +720,11 @@ public:
             return false;
         }
 
+        bool is_keyframe = !!(output_buf.flags & V4L2_BUF_FLAG_KEYFRAME);
+        if (is_keyframe) {
+            std::cout << "IDR frame detected!" << std::endl;
+        }
+
         // Copy H.264 data from pre-mapped output buffer
         size_t h264_size = output_planes[0].bytesused;
         h264_data.resize(h264_size);
@@ -1003,7 +1008,8 @@ public:
         }
 
         // Determine how many times to send (first frame gets sent multiple times)
-        int send_count = first_frame_ ? 3 : 1;
+        // int send_count = first_frame_ ? 3 : 1;
+        int send_count = 1; // Disabled repeated sending for first frame to reduce bandwidth
 
         // Broadcast data to all connected clients
         for (int repeat = 0; repeat < send_count; ++repeat) {
@@ -1028,6 +1034,7 @@ public:
                         failed = true;
                         break;
                     }
+                    std::cout << "Sent " << sent << " bytes to client fd=" << client_fd << std::endl;
                     total_sent += sent;
                 }
 
@@ -1124,6 +1131,25 @@ public:
         if (broadcaster_) {
             broadcaster_->send(data);
         }
+    }
+};
+
+class TelegramSender {
+private:
+    std::string bot_token_;
+    std::string chat_id_;
+    int frame_counter_ = 0;
+
+public:
+    TelegramSender(const std::string& token, const std::string& chat_id)
+        : bot_token_(token), chat_id_(chat_id) {}
+
+    void send(const std::vector<unsigned char>& data) {
+        // Implement Telegram API call to send 'data' to 'chat_id_' using 'bot_token_'
+        std::cout << "Sending frame " << frame_counter_++ << " to Telegram chat " << chat_id_ << std::endl;
+        std::string filename = "./frame_" + std::to_string(frame_counter_) + ".jpg";
+        std::ofstream file(filename, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(data.data()), data.size());
     }
 };
 
@@ -1450,8 +1476,8 @@ public:
         bool should_record = true;
         if (motion_detector_ && first_plane.length >= 0) {
             // Frame skipping optimization - only process every N-th frame
-            motion_frame_counter_++;
-            bool should_detect = true;
+            bool should_detect = (motion_frame_counter_ % motion_frame_skip_ == 0);
+            motion_frame_counter_ = (motion_frame_counter_ + 1) % motion_frame_skip_;
 
             bool motion = false;
             if (should_detect) {
@@ -1474,14 +1500,7 @@ public:
                 auto time_since_motion = std::chrono::duration_cast<std::chrono::seconds>(now - last_motion_time_);
 
                 if (time_since_motion > motion_tail_duration_) {
-                    // Motion stopped and tail period expired - skip recording
-                    // std::cout << "[MOTION] No motion for " << time_since_motion.count()
-                    //           << "s, skipping frame" << std::endl;
                     should_record = false;
-                } else {
-                    // Still in tail recording period
-                    // std::cout << "[MOTION] Tail recording (" << time_since_motion.count()
-                    //           << "/" << motion_tail_duration_.count() << "s)" << std::endl;
                 }
             }
         }
@@ -1759,9 +1778,9 @@ int main(int argc, char *argv[]) {
     }
 
     try {
-        TcpSender tcp_sender_mjpeg(std::string(argv[1]), std::stoi(argv[2]) - 1); // Port for MJPEG
+        TelegramSender sender_mjpeg(std::string("argv[1]"), std::string("argv[2]")); // Use actual token and chat ID
 
-        MjpegFrameHandler<TcpSender> mjpeg_handler(std::move(tcp_sender_mjpeg));
+        MjpegFrameHandler<TelegramSender> mjpeg_handler(std::move(sender_mjpeg));
 
         // if (std::string(argv[1]) != "connect" && std::string(argv[1]) != "accept") {
         //     std::cerr << "Invalid mode. Use 'connect' or 'accept'." << std::endl;
@@ -1800,8 +1819,8 @@ int main(int argc, char *argv[]) {
         capturer.enableAutofocus(true);
         capturer.setFrameRate(30);  // 30 FPS
         capturer.enableMotionDetection(true); // Enable motion detection by default
-        capturer.setMotionFrameSkip(10); // Process every 30th frame
-        capturer.setMotionTailDuration(10); // Record for 3 seconds after motion stops
+        capturer.setMotionFrameSkip(10); // Process every 10th frame
+        capturer.setMotionTailDuration(5); // Record for 5 seconds after motion stops
 
         if (capturer.isH264Available()) {
             std::cout << "H.264 hardware encoder detected!" << std::endl;
@@ -1812,7 +1831,7 @@ int main(int argc, char *argv[]) {
             std::cout << "H.264 hardware encoder not available, using JPEG only" << std::endl;
         }
 
-        capturer.enableMjpegOutput(false);
+        capturer.enableMjpegOutput(true);
         capturer.enableH264Output(true);
 
         if (!capturer.startCapture()) {
