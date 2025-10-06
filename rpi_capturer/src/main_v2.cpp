@@ -3,12 +3,12 @@
 #include <memory>
 #include <thread>
 #include <chrono>
+#include <mutex>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <turbojpeg.h>
 #include <vector>
-#include <map>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -28,352 +28,16 @@
 
 using namespace libcamera;
 
-// Shared buffer pool for memory mappings with LRU eviction
-class SharedBufferPool {
-private:
-    struct BufferMapping {
-        void* mapped_data = nullptr;
-        size_t size = 0;
-        uint64_t last_access_time = 0;  // For LRU eviction
+// V4L2 Control IDs for video encoder
+namespace V4L2Controls {
+    enum class VideoEncoder : uint32_t {
+        GOP_SIZE = 0x009909cb,           // V4L2_CID_MPEG_VIDEO_GOP_SIZE
+        FORCE_KEY_FRAME = 0x009909e5,    // V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME
+        REPEAT_SEQ_HEADER = 0x009909e2,  // V4L2_CID_MPEG_VIDEO_H264_I_PERIOD (SPS/PPS repeat)
+        BITRATE_MODE = 0x009909ce,       // V4L2_CID_MPEG_VIDEO_BITRATE_MODE
+        BITRATE = 0x009909cf             // V4L2_ID_MPEG_VIDEO_BITRATE
     };
-
-    std::map<int, BufferMapping> buffer_mappings_;  // fd -> mapping
-    static const size_t MAX_BUFFER_MAPPINGS = 12;   // Increased for shared usage
-    uint64_t access_counter_ = 0;  // Monotonic counter for LRU
-
-    // LRU eviction helper
-    void evictOldestMapping() {
-        if (buffer_mappings_.empty()) return;
-
-        auto oldest_it = buffer_mappings_.begin();
-        for (auto it = buffer_mappings_.begin(); it != buffer_mappings_.end(); ++it) {
-            if (it->second.last_access_time < oldest_it->second.last_access_time) {
-                oldest_it = it;
-            }
-        }
-
-        // Cleanup the mapping
-        if (oldest_it->second.mapped_data && oldest_it->second.mapped_data != MAP_FAILED) {
-            munmap(oldest_it->second.mapped_data, oldest_it->second.size);
-        }
-
-        std::cout << "SharedBufferPool: Evicted mapping for fd=" << oldest_it->first
-                  << " (LRU, access_time=" << oldest_it->second.last_access_time << ")" << std::endl;
-
-        buffer_mappings_.erase(oldest_it);
-    }
-
-public:
-    ~SharedBufferPool() {
-        // Cleanup all mappings
-        for (auto& pair : buffer_mappings_) {
-            if (pair.second.mapped_data && pair.second.mapped_data != MAP_FAILED) {
-                munmap(pair.second.mapped_data, pair.second.size);
-            }
-        }
-        buffer_mappings_.clear();
-    }
-
-    // Get or create mapping for file descriptor
-    void* getMapping(int dma_fd, size_t total_size, const std::string& client_name = "unknown") {
-        if (dma_fd < 0 || total_size == 0) {
-            return nullptr;
-        }
-
-        // Get or create mapping for this fd with LRU eviction
-        auto it = buffer_mappings_.find(dma_fd);
-        void* mapped_data = nullptr;
-
-        if (it == buffer_mappings_.end() || it->second.size != total_size) {
-            // Need to create new mapping
-            if (it != buffer_mappings_.end() && it->second.mapped_data) {
-                // Cleanup old mapping with different size
-                munmap(it->second.mapped_data, it->second.size);
-                buffer_mappings_.erase(it);
-            }
-
-            // Check if we need to evict oldest mapping before adding new one
-            if (buffer_mappings_.size() >= MAX_BUFFER_MAPPINGS) {
-                evictOldestMapping();
-            }
-
-            mapped_data = mmap(nullptr, total_size, PROT_READ, MAP_SHARED, dma_fd, 0);
-            if (mapped_data == MAP_FAILED) {
-                std::cerr << "SharedBufferPool: Failed to mmap for " << client_name
-                          << ", fd=" << dma_fd << ": " << strerror(errno) << std::endl;
-                return nullptr;
-            }
-
-            // Add new mapping with current access time
-            buffer_mappings_[dma_fd] = {mapped_data, total_size, ++access_counter_};
-            std::cout << "SharedBufferPool: New mapping for " << client_name
-                      << ", fd=" << dma_fd << ", size=" << total_size
-                      << " (total: " << buffer_mappings_.size() << ")" << std::endl;
-        } else {
-            // Use existing mapping and update access time
-            mapped_data = it->second.mapped_data;
-            it->second.last_access_time = ++access_counter_;
-        }
-
-        return mapped_data;
-    }
-
-    // Debug utility
-    void printStats() const {
-        std::cout << "SharedBufferPool: " << buffer_mappings_.size()
-                  << "/" << MAX_BUFFER_MAPPINGS << " mappings:" << std::endl;
-        for (const auto& pair : buffer_mappings_) {
-            std::cout << "  fd=" << pair.first
-                      << " size=" << pair.second.size
-                      << " access_time=" << pair.second.last_access_time << std::endl;
-        }
-    }
-};
-
-// Global shared buffer pool instance
-static SharedBufferPool g_buffer_pool;
-
-// Smart Streaming Policies
-enum class StreamingState {
-    STARTUP,        // Initial phase - always encode
-    MOTION_ACTIVE,  // Motion detected - active encoding
-    STABILIZING,    // Motion stopped - waiting for stabilization
-    STATIC_CACHED,  // Static scene - send cached frames
-    MOTION_RESUME   // Motion resumed - quick transition
-};
-
-struct SceneAnalysis {
-    bool motion_detected = false;
-    bool af_stable = false;
-    float motion_level = 0.0f;
-    std::chrono::milliseconds since_last_motion{0};
-    std::chrono::milliseconds since_af_stable{0};
-};
-
-// Always stream policy (current behavior)
-class AlwaysStreamPolicy {
-public:
-    bool shouldEncodeH264(const SceneAnalysis&) { return true; }
-    bool shouldEncodeMJPEG(const SceneAnalysis&) { return true; }
-    void onFrameEncoded(const std::vector<unsigned char>&, bool) {}
-    template<typename H264Handler, typename MJPEGHandler>
-    void sendCachedFrame(H264Handler&, MJPEGHandler&) {}
-};
-
-// Motion-triggered stream policy
-class MotionStreamPolicy {
-private:
-    bool motion_active_ = false;
-    std::chrono::steady_clock::time_point last_motion_time_;
-
-public:
-    bool shouldEncodeH264(const SceneAnalysis& scene) {
-        updateMotionState(scene);
-        return motion_active_;
-    }
-
-    bool shouldEncodeMJPEG(const SceneAnalysis& scene) {
-        updateMotionState(scene);
-        return motion_active_;
-    }
-
-    void onFrameEncoded(const std::vector<unsigned char>&, bool) {}
-    template<typename H264Handler, typename MJPEGHandler>
-    void sendCachedFrame(H264Handler&, MJPEGHandler&) {}
-
-private:
-    void updateMotionState(const SceneAnalysis& scene) {
-        if (scene.motion_detected) {
-            motion_active_ = true;
-            last_motion_time_ = std::chrono::steady_clock::now();
-        } else {
-            auto now = std::chrono::steady_clock::now();
-            auto time_since_motion = std::chrono::duration_cast<std::chrono::seconds>(now - last_motion_time_);
-            if (time_since_motion > std::chrono::seconds(3)) {
-                motion_active_ = false;
-            }
-        }
-    }
-};
-
-// Hybrid smart streaming policy
-class HybridStreamPolicy {
-private:
-    StreamingState current_state_ = StreamingState::STARTUP;
-    std::chrono::steady_clock::time_point startup_time_;
-    std::chrono::steady_clock::time_point stabilize_start_;
-    std::chrono::steady_clock::time_point cache_timestamp_;
-    std::chrono::steady_clock::time_point last_cache_send_;
-
-    // Cached frames
-    std::vector<unsigned char> cached_h264_frame_;
-    std::vector<unsigned char> cached_mjpeg_frame_;
-    bool has_cached_frames_ = false;
-
-    // Cache transmission throttling
-    std::chrono::milliseconds cache_send_interval_{1000}; // Send cached frame every 1 second instead of 30 FPS
-
-public:
-    HybridStreamPolicy() : startup_time_(std::chrono::steady_clock::now()),
-                          last_cache_send_(std::chrono::steady_clock::now()) {}
-
-    bool shouldEncodeH264(const SceneAnalysis& scene) {
-        return shouldEncode(scene);
-    }
-
-    bool shouldEncodeMJPEG(const SceneAnalysis& scene) {
-        return shouldEncode(scene);
-    }
-
-    void onFrameEncoded(const std::vector<unsigned char>& frame_data, bool is_h264) {
-        // Cache the frame when transitioning to static mode
-        if (current_state_ == StreamingState::STABILIZING) {
-            if (is_h264) {
-                // Only cache I-frames for H.264 to avoid decoder issues
-                if (isIFrame(frame_data)) {
-                    cached_h264_frame_ = frame_data;
-                    std::cout << "[CACHE] Cached H.264 I-frame (" << frame_data.size() << " bytes)" << std::endl;
-                } else {
-                    std::cout << "[CACHE] Skipping H.264 P-frame (waiting for I-frame)" << std::endl;
-                    return; // Don't set has_cached_frames_ yet
-                }
-            } else {
-                // Always cache MJPEG frames (they're always complete)
-                cached_mjpeg_frame_ = frame_data;
-                std::cout << "[CACHE] Cached MJPEG frame (" << frame_data.size() << " bytes)" << std::endl;
-            }
-            has_cached_frames_ = true;
-            cache_timestamp_ = std::chrono::steady_clock::now();
-        }
-    }
-
-    template<typename H264Handler, typename MJPEGHandler>
-    void sendCachedFrame(H264Handler& h264_handler, MJPEGHandler& mjpeg_handler) {
-        if (!has_cached_frames_) return;
-
-        auto now = std::chrono::steady_clock::now();
-        auto time_since_last_send = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_cache_send_);
-
-        // Only send cached frame if enough time has passed (throttling)
-        if (time_since_last_send >= cache_send_interval_) {
-            if (!cached_h264_frame_.empty()) {
-                h264_handler(cached_h264_frame_);
-            }
-            if (!cached_mjpeg_frame_.empty()) {
-                mjpeg_handler(cached_mjpeg_frame_);
-            }
-            last_cache_send_ = now;
-
-            // Debug: Log cache transmission
-            static int cache_send_count = 0;
-            std::cout << "[CACHE] Sent cached frame #" << ++cache_send_count
-                      << " (interval: " << time_since_last_send.count() << "ms)" << std::endl;
-        }
-    }
-
-private:
-    bool shouldEncode(const SceneAnalysis& scene) {
-        auto now = std::chrono::steady_clock::now();
-
-        // Only log state changes, not every frame
-        static int last_logged_state = -1;
-        if (static_cast<int>(current_state_) != last_logged_state) {
-            std::cout << "[DEBUG] State=" << static_cast<int>(current_state_)
-                      << ", motion=" << scene.motion_detected
-                      << ", af_stable=" << scene.af_stable
-                      << ", motion_level=" << scene.motion_level << std::endl;
-            last_logged_state = static_cast<int>(current_state_);
-        }
-
-        switch (current_state_) {
-            case StreamingState::STARTUP: {
-                auto startup_duration = std::chrono::duration_cast<std::chrono::seconds>(now - startup_time_);
-                if (startup_duration > std::chrono::seconds(10)) {
-                    transitionTo(scene.motion_detected ? StreamingState::MOTION_ACTIVE : StreamingState::STABILIZING);
-                }
-                return true;
-            }
-
-            case StreamingState::MOTION_ACTIVE: {
-                if (!scene.motion_detected && scene.motion_level < 1.0f) {
-                    transitionTo(StreamingState::STABILIZING);
-                    stabilize_start_ = now;
-                }
-                return true;
-            }
-
-            case StreamingState::STABILIZING: {
-                auto stabilize_duration = std::chrono::duration_cast<std::chrono::seconds>(now - stabilize_start_);
-                if (scene.af_stable && scene.since_last_motion > std::chrono::milliseconds(2000)) {
-                    transitionTo(StreamingState::STATIC_CACHED);
-                    return true; // Last encoding before cache mode
-                }
-                if (scene.motion_detected) {
-                    transitionTo(StreamingState::MOTION_ACTIVE);
-                }
-                return true;
-            }
-
-            case StreamingState::STATIC_CACHED: {
-                if (scene.motion_detected || scene.motion_level > 2.0f) {
-                    transitionTo(StreamingState::MOTION_RESUME);
-                    return true;
-                }
-                // Refresh cache every 30 seconds
-                auto cache_age = std::chrono::duration_cast<std::chrono::seconds>(now - cache_timestamp_);
-                if (cache_age > std::chrono::seconds(30)) {
-                    cache_timestamp_ = now;
-                    return true;
-                }
-                return false; // Send cached frame
-            }
-
-            case StreamingState::MOTION_RESUME: {
-                transitionTo(StreamingState::MOTION_ACTIVE);
-                return true;
-            }
-        }
-        return true;
-    }
-
-    void transitionTo(StreamingState new_state) {
-        if (new_state != current_state_) {
-            const char* state_names[] = {"STARTUP", "MOTION_ACTIVE", "STABILIZING", "STATIC_CACHED", "MOTION_RESUME"};
-            std::cout << "StreamingState: " << state_names[static_cast<int>(current_state_)]
-                      << " -> " << state_names[static_cast<int>(new_state)] << std::endl;
-            current_state_ = new_state;
-        }
-    }
-
-    // Configuration methods
-public:
-    void setCacheSendInterval(std::chrono::milliseconds interval) {
-        cache_send_interval_ = interval;
-        std::cout << "Cache send interval set to " << interval.count() << "ms" << std::endl;
-    }
-
-private:
-    // Detect if frame is an I-frame (keyframe)
-    bool isIFrame(const std::vector<unsigned char>& h264_data) const {
-        // H.264 NAL unit header analysis
-        // Look for NAL unit type 5 (IDR slice) or type 7/8 (SPS/PPS)
-        for (size_t i = 0; i < h264_data.size() - 4; ++i) {
-            // Find NAL unit start code (0x00 0x00 0x00 0x01)
-            if (h264_data[i] == 0x00 && h264_data[i+1] == 0x00 &&
-                h264_data[i+2] == 0x00 && h264_data[i+3] == 0x01) {
-
-                if (i + 4 < h264_data.size()) {
-                    uint8_t nal_type = h264_data[i+4] & 0x1F;
-                    // NAL type 5 = IDR slice (I-frame), 7 = SPS, 8 = PPS
-                    if (nal_type == 5 || nal_type == 7 || nal_type == 8) {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-};
+}
 
 class MotionDetector {
 private:
@@ -406,55 +70,6 @@ public:
         std::cout << "MotionDetector initialized: " << full_width_ << "x" << full_height_
                   << " -> " << sample_width_ << "x" << sample_height_
                   << " (downsample: " << downsample_factor_ << ")" << std::endl;
-    }
-
-    bool detectMotion(int dma_fd, size_t total_size, size_t y_size) {
-        if (dma_fd < 0 || y_size < full_width_ * full_height_) {
-            return false;
-        }
-
-        // Use shared buffer pool
-        void* mapped_data = g_buffer_pool.getMapping(dma_fd, total_size, "MotionDetector");
-        if (!mapped_data) {
-            return false;
-        }
-
-        unsigned char* y_data = static_cast<unsigned char*>(mapped_data);
-
-        // Reset statistics
-        motion_pixel_count_ = 0;
-        motion_detected_ = false;
-
-        // Skip first frame (no previous frame to compare)
-        if (first_frame_) {
-            downsampleYFrame(y_data, prev_y_frame_.data());
-            first_frame_ = false;
-            return false;
-        }
-
-        // Downsample current frame
-        std::vector<unsigned char> current_frame(sample_width_ * sample_height_);
-        downsampleYFrame(y_data, current_frame.data());
-
-        // Compare with previous frame using NEON if available
-        int total_pixels = sample_width_ * sample_height_;
-
-#ifdef __ARM_NEON
-        motion_pixel_count_ = compareFramesNEON(current_frame.data(), prev_y_frame_.data(), total_pixels);
-#else
-        motion_pixel_count_ = compareFramesScalar(current_frame.data(), prev_y_frame_.data(), total_pixels);
-#endif
-
-        // Calculate motion level as percentage
-        last_motion_level_ = (float)motion_pixel_count_ / total_pixels * 100.0f;
-
-        // Detect motion if threshold exceeded
-        motion_detected_ = last_motion_level_ > (motion_area_threshold_ * 100.0f);
-
-        // Store current frame as previous for next iteration
-        prev_y_frame_ = std::move(current_frame);
-
-        return motion_detected_;
     }
 
     bool detectMotion(unsigned char* y_data, size_t y_size) {
@@ -509,12 +124,6 @@ public:
     float getMotionLevel() const { return last_motion_level_; }
     int getMotionPixelCount() const { return motion_pixel_count_; }
     bool isMotionDetected() const { return motion_detected_; }
-
-    // Reset method for FPS switching
-    void resetDetectionState() {
-        first_frame_ = true;
-        std::cout << "[MotionDetector] Detection state reset due to FPS change" << std::endl;
-    }
 
 private:
     void downsampleYFrame(unsigned char* full_frame, unsigned char* sampled_frame) {
@@ -704,7 +313,7 @@ public:
         ssize_t total_sent = 0;
         ssize_t data_size = data.size();
         while (total_sent < data_size) {
-            ssize_t sent = send(sockfd_, data.data() + total_sent, data_size - total_sent, 0);
+            ssize_t sent = ::send(sockfd_, data.data() + total_sent, data_size - total_sent, 0);
             if (sent < 0) {
                 std::cerr << "Failed to send data" << std::endl;
                 return false;
@@ -1039,7 +648,7 @@ private:
 
 public:
     // Zero-copy encoding using DMA file descriptor
-    bool encodeDMA(int dma_fd, size_t offset, size_t length, std::vector<unsigned char>& h264_data) {
+    bool encodeDMA(int dma_fd, std::vector<unsigned char>& h264_data) {
         if (!initialized_) {
             std::cerr << "H.264 encoder not initialized" << std::endl;
             return false;
@@ -1139,7 +748,7 @@ public:
         memset(&ext_ctrls, 0, sizeof(ext_ctrls));
         memset(&ext_ctrl, 0, sizeof(ext_ctrl));
 
-        ext_ctrl.id = 0x009909cb;  // video_gop_size control
+        ext_ctrl.id = static_cast<uint32_t>(V4L2Controls::VideoEncoder::GOP_SIZE);
         ext_ctrl.value = gop_size;
 
         ext_ctrls.count = 1;
@@ -1156,7 +765,7 @@ public:
         memset(&verify_ctrls, 0, sizeof(verify_ctrls));
         memset(&verify_ctrl, 0, sizeof(verify_ctrl));
 
-        verify_ctrl.id = 0x009909cb;
+        verify_ctrl.id = static_cast<uint32_t>(V4L2Controls::VideoEncoder::GOP_SIZE);
         verify_ctrls.count = 1;
         verify_ctrls.controls = &verify_ctrl;
 
@@ -1180,7 +789,7 @@ public:
         memset(&force_ctrls, 0, sizeof(force_ctrls));
         memset(&force_ctrl, 0, sizeof(force_ctrl));
 
-        force_ctrl.id = 0x009909e5;  // force_key_frame
+        force_ctrl.id = static_cast<uint32_t>(V4L2Controls::VideoEncoder::FORCE_KEY_FRAME);
         force_ctrl.value = 1;        // Any value triggers the action
 
         force_ctrls.count = 1;
@@ -1207,7 +816,7 @@ public:
         memset(&ext_ctrls, 0, sizeof(ext_ctrls));
         memset(&ext_ctrl, 0, sizeof(ext_ctrl));
 
-        ext_ctrl.id = 0x009909e2;  // repeat_sequence_header control
+        ext_ctrl.id = static_cast<uint32_t>(V4L2Controls::VideoEncoder::REPEAT_SEQ_HEADER);
         ext_ctrl.value = enable ? 1 : 0;
 
         ext_ctrls.count = 1;
@@ -1224,7 +833,7 @@ public:
         memset(&verify_ctrls, 0, sizeof(verify_ctrls));
         memset(&verify_ctrl, 0, sizeof(verify_ctrl));
 
-        verify_ctrl.id = 0x009909e2;
+        verify_ctrl.id = static_cast<uint32_t>(V4L2Controls::VideoEncoder::REPEAT_SEQ_HEADER);
         verify_ctrls.count = 1;
         verify_ctrls.controls = &verify_ctrl;
 
@@ -1251,7 +860,7 @@ public:
         memset(&mode_ctrls, 0, sizeof(mode_ctrls));
         memset(&mode_ctrl, 0, sizeof(mode_ctrl));
 
-        mode_ctrl.id = 0x009909ce;  // video_bitrate_mode
+        mode_ctrl.id = static_cast<uint32_t>(V4L2Controls::VideoEncoder::BITRATE_MODE);
         mode_ctrl.value = cbr ? 1 : 0;  // 0=VBR, 1=CBR 
 
         mode_ctrls.count = 1;
@@ -1268,7 +877,7 @@ public:
         memset(&bitrate_ctrls, 0, sizeof(bitrate_ctrls));
         memset(&bitrate_ctrl, 0, sizeof(bitrate_ctrl));
 
-        bitrate_ctrl.id = 0x009909cf;  // video_bitrate
+        bitrate_ctrl.id = static_cast<uint32_t>(V4L2Controls::VideoEncoder::BITRATE);
         bitrate_ctrl.value = bitrate;
 
         bitrate_ctrls.count = 1;
@@ -1285,7 +894,7 @@ public:
         memset(&verify_ctrls, 0, sizeof(verify_ctrls));
         memset(&verify_ctrl, 0, sizeof(verify_ctrl));
 
-        verify_ctrl.id = 0x009909cf; // video_bitrate
+        verify_ctrl.id = static_cast<uint32_t>(V4L2Controls::VideoEncoder::BITRATE);
         verify_ctrls.count = 1;
         verify_ctrls.controls = &verify_ctrl;
 
@@ -1301,6 +910,223 @@ public:
 };
 
 // Transport layer classes
+
+// TCP Broadcaster - accepts up to N clients and broadcasts data to all connected clients
+class TcpBroadcaster {
+private:
+    int server_fd_;                    // Server socket file descriptor
+    int server_port_;                  // Server port to listen on
+    std::vector<int> client_sockets_;  // List of connected client sockets
+    mutable std::mutex clients_mutex_; // Mutex to protect client_sockets_ from race conditions (mutable for const methods)
+    int max_clients_;                  // Maximum number of simultaneous clients
+    bool running_;                     // Flag to control accept thread
+    std::thread accept_thread_;        // Thread for accepting new client connections
+    bool first_frame_;                 // Track first frame for initial burst transmission
+
+public:
+    TcpBroadcaster(int server_port, int max_clients = 5)
+        : server_fd_(-1), server_port_(server_port), max_clients_(max_clients),
+          running_(false), first_frame_(true) {
+
+        // Create server socket
+        server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd_ < 0) {
+            std::cerr << "Failed to create server socket" << std::endl;
+            return;
+        }
+
+        // Set socket options: allow address reuse (useful for quick restart)
+        int opt = 1;
+        if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+            std::cerr << "Failed to set SO_REUSEADDR" << std::endl;
+        }
+
+        // Bind socket to port
+        struct sockaddr_in server_addr;
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(server_port_);
+        server_addr.sin_addr.s_addr = INADDR_ANY;  // Accept connections on any interface
+
+        if (bind(server_fd_, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+            std::cerr << "Failed to bind socket to port " << server_port_
+                     << ": " << strerror(errno) << std::endl;
+            close(server_fd_);
+            server_fd_ = -1;
+            return;
+        }
+
+        // Start listening for connections
+        if (listen(server_fd_, max_clients_) < 0) {
+            std::cerr << "Failed to listen on socket: " << strerror(errno) << std::endl;
+            close(server_fd_);
+            server_fd_ = -1;
+            return;
+        }
+
+        // Start accept thread
+        running_ = true;
+        accept_thread_ = std::thread(&TcpBroadcaster::acceptClients, this);
+
+        std::cout << "TCP broadcaster started on port " << server_port_
+                  << " (max clients: " << max_clients_ << ")" << std::endl;
+    }
+
+    ~TcpBroadcaster() {
+        // Stop accept thread
+        running_ = false;
+        if (accept_thread_.joinable()) {
+            accept_thread_.join();
+        }
+
+        // Close all client connections
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        for (int client_fd : client_sockets_) {
+            close(client_fd);
+        }
+        client_sockets_.clear();
+
+        // Close server socket
+        if (server_fd_ >= 0) {
+            close(server_fd_);
+        }
+
+        std::cout << "TCP broadcaster stopped" << std::endl;
+    }
+
+    // Send data to all connected clients
+    void send(const std::vector<unsigned char>& data) {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+
+        // No clients connected - skip transmission
+        if (client_sockets_.empty()) {
+            return;
+        }
+
+        // Determine how many times to send (first frame gets sent multiple times)
+        int send_count = first_frame_ ? 3 : 1;
+
+        // Broadcast data to all connected clients
+        for (int repeat = 0; repeat < send_count; ++repeat) {
+            auto it = client_sockets_.begin();
+            while (it != client_sockets_.end()) {
+                int client_fd = *it;
+
+                // Send data to this client
+                ssize_t total_sent = 0;
+                ssize_t data_size = data.size();
+                bool failed = false;
+
+                while (total_sent < data_size) {
+                    // MSG_NOSIGNAL prevents SIGPIPE when client disconnects
+                    ssize_t sent = ::send(client_fd, data.data() + total_sent,
+                                         data_size - total_sent, MSG_NOSIGNAL);
+                    if (sent < 0) {
+                        std::cerr << "Failed to send to client fd=" << client_fd
+                                 << ", disconnecting: " << strerror(errno) << std::endl;
+                        close(client_fd);
+                        it = client_sockets_.erase(it);
+                        failed = true;
+                        break;
+                    }
+                    total_sent += sent;
+                }
+
+                // Move to next client only if send succeeded
+                if (!failed) {
+                    ++it;
+                }
+            }
+        }
+
+        // Mark first frame as sent
+        if (first_frame_) {
+            std::cout << "First frame sent " << send_count
+                     << " times to " << client_sockets_.size() << " client(s)" << std::endl;
+            first_frame_ = false;
+        }
+    }
+
+    // Get number of currently connected clients
+    int getClientCount() const {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        return client_sockets_.size();
+    }
+
+private:
+    // Thread function to accept new client connections
+    void acceptClients() {
+        if (server_fd_ < 0) {
+            std::cerr << "Accept thread: invalid server socket" << std::endl;
+            return;
+        }
+
+        while (running_) {
+            // Use poll to check for incoming connections with timeout
+            struct pollfd pfd;
+            pfd.fd = server_fd_;
+            pfd.events = POLLIN;
+
+            int poll_ret = poll(&pfd, 1, 1000); // 1 second timeout
+            if (poll_ret <= 0) {
+                // Timeout or error - continue loop to check running_ flag
+                continue;
+            }
+
+            // Accept new client connection
+            struct sockaddr_in client_addr;
+            socklen_t addr_len = sizeof(client_addr);
+            int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &addr_len);
+
+            if (client_fd < 0) {
+                if (running_) {  // Only log if we're still running (not shutting down)
+                    std::cerr << "Failed to accept connection: " << strerror(errno) << std::endl;
+                }
+                continue;
+            }
+
+            // Get client IP address for logging
+            char client_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+
+            // Check if we've reached max clients
+            {
+                std::lock_guard<std::mutex> lock(clients_mutex_);
+
+                if (client_sockets_.size() >= static_cast<size_t>(max_clients_)) {
+                    std::cerr << "Max clients (" << max_clients_
+                             << ") reached, rejecting connection from " << client_ip << std::endl;
+                    close(client_fd);
+                    continue;
+                }
+
+                // Add client to list
+                client_sockets_.push_back(client_fd);
+                std::cout << "Client connected from " << client_ip
+                         << " (fd=" << client_fd << ", total clients: "
+                         << client_sockets_.size() << "/" << max_clients_ << ")" << std::endl;
+            }
+        }
+
+        std::cout << "Accept thread terminated" << std::endl;
+    }
+};
+
+class TcpBroadcastSender {
+private:
+    std::unique_ptr<TcpBroadcaster> broadcaster_;
+
+public:
+    TcpBroadcastSender(int server_port, int max_clients = 5) {
+        broadcaster_ = std::make_unique<TcpBroadcaster>(server_port, max_clients);
+    }
+
+    void send(const std::vector<unsigned char>& data) {
+        if (broadcaster_) {
+            broadcaster_->send(data);
+        }
+    }
+};
+
 class TcpSender {
 private:
     std::unique_ptr<TcpClient> tcp_client_;
@@ -1310,20 +1136,27 @@ public:
     TcpSender(const std::string& server_ip, int server_port) {
         tcp_client_ = std::make_unique<TcpClient>(server_ip, server_port);
         if (!tcp_client_->connect()) {
-            // throw std::runtime_error("Failed to connect to TCP server");
             std::cerr << "Warning: Failed to connect to TCP server" << std::endl;
         }
         std::cout << "TCP sender initialized successfully" << std::endl;
     }
 
     void send(const std::vector<unsigned char>& data) {
-        tcp_client_->sendData(data);
+        bool success = tcp_client_->sendData(data);
+        if (!success) {
+            std::cerr << "Failed to send data via TCP" << std::endl;
+            return;
+        }
         if (first_frame_) {
             // Send first frame multiple times for better streaming start
             for (int i = 0; i < 3; ++i) {
-                tcp_client_->sendData(data);
+                success = tcp_client_->sendData(data);
             }
-            std::cout << "First frame sent via TCP" << std::endl;
+            if (!success) {
+                std::cerr << "Failed to send first frame multiple times via TCP" << std::endl;
+            } else {
+                std::cout << "First frame sent multiple times via TCP for better start" << std::endl;
+            }
             first_frame_ = false;
         }
     }
@@ -1407,21 +1240,12 @@ private:
     bool capture_running_ = false;
 
     // Frame rate settings
-    int active_fps_ = 30;      // FPS for active mode (motion detected)
-    int static_fps_ = 3;       // FPS for static mode (no motion)
     int current_fps_ = 30;     // Current FPS setting
     std::chrono::steady_clock::time_point last_frame_time_;
-    bool static_mode_ = false; // If true, disable motion detection and capture continuously
-    ControlList fps_controls_;  // Storage for FrameDurationLimits controls
 
     // Motion detection frame skip control
     int motion_frame_skip_ = 1;        // Process every N-th frame (1 = every frame)
     int motion_frame_counter_ = 0;     // Current frame counter
-
-    // FPS change handling
-    bool fps_changing_ = false;        // Flag indicating FPS is changing
-    int fps_change_frame_count_ = 0;   // Frames processed since FPS change
-    static const int FPS_STABILIZATION_FRAMES = 6; // Wait N frames before resetting motion detector
 
     // Camera resolution settings
     int width_ = 1920;
@@ -1437,16 +1261,6 @@ private:
         int range = 0;          // 0=Normal, 1=Macro, 2=Full
         bool use_windows = false;    // Use specific AF windows
     } af_settings_;
-
-protected:
-    // Members needed by SmartCapturerV2
-    std::unique_ptr<CameraConfiguration>& getConfig() { return config_; }
-    std::unique_ptr<MotionDetector>& getMotionDetector() { return motion_detector_; }
-    std::unique_ptr<H264Encoder>& getH264Encoder() { return h264_encoder_; }
-    std::unique_ptr<JpegEncoder>& getJpegEncoder() { return jpeg_encoder_; }
-    MjpegHandler& getMjpegHandler() { return mjpeg_handler_; }
-    H264Handler& getH264Handler() { return h264_handler_; }
-    bool isMjpegEnabled() const { return use_mjpeg_; }
 
 public:
     CapturerV2(MjpegHandler mjpeg_handler, H264Handler h264_handler, int width = 1920, int height = 1080)
@@ -1552,8 +1366,6 @@ public:
             return false;
         }
         
-        // std::cout << "Allocated " << ret << " buffers" << std::endl;
-        
         for (unsigned int i = 0; i < allocator_->buffers(stream).size(); ++i) {
             auto request = camera_->createRequest();
             if (!request) {
@@ -1626,10 +1438,12 @@ public:
     }
 
     virtual void processingFrameBuffer(const FrameBuffer *buffer) {
-        bool h264_sent = false;
-
         size_t total_yuv_size = width_ * height_ * 3 / 2;
         void *mapped_data = mmap(nullptr, total_yuv_size, PROT_READ, MAP_SHARED, buffer->planes()[0].fd.get(), 0);
+        if (mapped_data == MAP_FAILED) {
+            std::cerr << "Failed to mmap frame buffer" << std::endl;
+            return;
+        }
         const FrameBuffer::Plane &first_plane = buffer->planes()[0];
 
         // Motion detection BEFORE encoding (using Y plane only)
@@ -1637,7 +1451,7 @@ public:
         if (motion_detector_ && first_plane.length >= 0) {
             // Frame skipping optimization - only process every N-th frame
             motion_frame_counter_++;
-            bool should_detect = static_mode_ ? true : (motion_frame_counter_ % motion_frame_skip_ == 0);
+            bool should_detect = true;
 
             bool motion = false;
             if (should_detect) {
@@ -1650,14 +1464,6 @@ public:
             if (motion) {
                 // Update last motion time
                 last_motion_time_ = std::chrono::steady_clock::now();
-
-                // Auto-switch to high FPS when motion detected (only on state change)
-                /*if (static_mode_) {
-                    setFrameRate(active_fps_);  // Switch to active FPS (30 FPS)
-                    std::cout << "[AUTO-FPS] Motion detected! Switched to " << active_fps_ << " FPS" << std::endl;
-                    static_mode_ = false;  // Exit static mode immediately
-                }*/
-                // current_fps_ = active_fps_;
 
                 std::cout << "[MOTION] Detected! Level: " << std::fixed << std::setprecision(2)
                           << motion_detector_->getMotionLevel() << "%, Pixels: "
@@ -1672,14 +1478,6 @@ public:
                     // std::cout << "[MOTION] No motion for " << time_since_motion.count()
                     //           << "s, skipping frame" << std::endl;
                     should_record = false;
-                    // current_fps_ = static_fps_;
-
-                    // Auto-switch to low FPS when entering static mode (only on state change)
-                    /*if (!static_mode_) {
-                        setFrameRate(static_fps_);  // Switch to static FPS (1 FPS)
-                        std::cout << "[AUTO-FPS] Entering static mode. Switched to " << static_fps_ << " FPS" << std::endl;
-                        static_mode_ = true;  // Enter static mode
-                    }*/
                 } else {
                     // Still in tail recording period
                     // std::cout << "[MOTION] Tail recording (" << time_since_motion.count()
@@ -1688,31 +1486,12 @@ public:
             }
         }
 
-        // Skip encoding if motion-based recording is disabled
-        // if (!should_record) {
-        //     if (!static_mode_) {
-        //         std::cout << "[MOTION] Entering static mode." << std::endl;
-        //         // current_fps_ = static_fps_;
-        //         static_mode_ = true;  // Enter static mode
-        //     }
-        //     // sleep for frame duration to maintain timing
-        //     // std::this_thread::sleep_for(std::chrono::milliseconds(1000 / (int)(current_fps_/motion_frame_skip_) - 50));
-        //     munmap(mapped_data, total_yuv_size);
-        //     return;
-        // }
-        // if (static_mode_) {
-        //     std::cout << "[MOTION] Exiting static mode." << std::endl;
-        //     // current_fps_ = active_fps_;
-        //     static_mode_ = false;  // Exit static mode
-        // }
-
         // Try H.264 encoding and output if enabled
         if (use_h264_output_ && use_h264_ && h264_encoder_) {
             std::vector<unsigned char> h264_data;
 
-            if (h264_encoder_->encodeDMA(first_plane.fd.get(), 0, total_yuv_size, h264_data)) {                
+            if (h264_encoder_->encodeDMA(first_plane.fd.get(), h264_data)) {                
                 h264_handler_(h264_data);
-                h264_sent = true;
             } else {
                 std::cout << "H.264 DMA encoding failed" << std::endl;
             }
@@ -1732,8 +1511,6 @@ public:
         if (req->status() == Request::RequestComplete) {
             frames_captured_++;
 
-            // std::cout << "Frame #" << frames_captured_ << " captured successfully" << std::endl;
-
             const Request::BufferMap &buffers = req->buffers();
             for (auto bufferPair : buffers) {
                 FrameBuffer *buffer = bufferPair.second;
@@ -1741,10 +1518,10 @@ public:
                 break;
             }
             
-            // Re-queue request with FPS throttling
             if (capture_running_) {
                 req->reuse(Request::ReuseBuffers);
 
+                // Rebuild controls for next request (autofocus, etc.)
                 ControlList controls = buildControls();
                 req->controls() = controls;
 
@@ -1887,34 +1664,6 @@ public:
         }
         current_fps_ = fps;
 
-        // // Use rpicam-apps approach: set FrameDurationLimits for hardware-level FPS control
-        // int64_t frame_time_us = 1000000 / fps;  // в микросекундах
-
-        // try {
-        //     ControlList controls;
-        //     controls.set(controls::FrameDurationLimits,
-        //                 libcamera::Span<const int64_t, 2>({ frame_time_us, frame_time_us }));
-
-        //     // Apply to camera if it's already configured
-        //     if (camera_ && capture_running_) {
-        //         // Will be applied to next requests automatically via buildAutofocusControls()
-        //         std::cout << "FrameDurationLimits set to " << frame_time_us << " us (" << fps << " FPS)" << std::endl;
-        //     }
-
-        //     // Store for future requests
-        //     fps_controls_ = controls;
-
-        // } catch (const std::exception& e) {
-        //     std::cerr << "Failed to set FrameDurationLimits: " << e.what() << std::endl;
-        //     return false;
-        // }
-
-        // // Reset motion detector state to prevent false detections after FPS change
-        // if (motion_detector_) {
-        //     motion_detector_->resetDetectionState();
-        // }
-
-        // std::cout << "Target frame rate set to " << fps << " FPS using hardware FrameDurationLimits" << std::endl;
         return true;
     }
 
@@ -2004,7 +1753,8 @@ int main(int argc, char *argv[]) {
     std::cout << "Camera Module v3 + Pi Zero 2W + libcamera" << std::endl;
 
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <server_ip> <server_port>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << "connect <server_ip> <server_port>" << std::endl;
+        std::cerr << "       " << argv[0] << "accept <server_port> [max_clients]" << std::endl;
         return -1;
     }
 
@@ -2013,8 +1763,21 @@ int main(int argc, char *argv[]) {
 
         MjpegFrameHandler<TcpSender> mjpeg_handler(std::move(tcp_sender_mjpeg));
 
-        TcpSender tcp_sender_h264(std::string(argv[1]), std::stoi(argv[2])); // Different port
-        H264FrameHandler<TcpSender> h264_handler(std::move(tcp_sender_h264));
+        // if (std::string(argv[1]) != "connect" && std::string(argv[1]) != "accept") {
+        //     std::cerr << "Invalid mode. Use 'connect' or 'accept'." << std::endl;
+        //     return -1;
+        // }
+        // if (std::string(argv[1]) == "client") {
+        //     TcpSender tcp_sender_h264(std::string(argv[1]), std::stoi(argv[2])); // Different port
+        //     H264FrameHandler<TcpSender> h264_handler(std::move(tcp_sender_h264));
+        // } else {
+            int max_clients = 5;
+            if (argc >= 4) {
+                max_clients = std::stoi(argv[3]);
+            }
+            TcpBroadcastSender tcp_broadcaster(std::stoi(argv[2]), max_clients);
+            H264FrameHandler<TcpBroadcastSender> h264_handler(std::move(tcp_broadcaster));
+        // }
 
         // Regular capturer (always encoding)
         CapturerV2 capturer(std::move(mjpeg_handler), std::move(h264_handler), 1920, 1080);
@@ -2039,7 +1802,6 @@ int main(int argc, char *argv[]) {
         capturer.enableMotionDetection(true); // Enable motion detection by default
         capturer.setMotionFrameSkip(10); // Process every 30th frame
         capturer.setMotionTailDuration(10); // Record for 3 seconds after motion stops
-
 
         if (capturer.isH264Available()) {
             std::cout << "H.264 hardware encoder detected!" << std::endl;
