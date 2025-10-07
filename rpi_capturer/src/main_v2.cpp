@@ -1792,12 +1792,13 @@ public:
 
         // Motion detection BEFORE encoding (using Y plane only)
         bool should_record = true;
+        bool motion = false;
+        bool should_detect = false;
         if (motion_detector_ && first_plane.length >= 0) {
             // Frame skipping optimization - only process every N-th frame
-            bool should_detect = (motion_frame_counter_ % motion_frame_skip_ == 0);
+            should_detect = (motion_frame_counter_ % motion_frame_skip_ == 0);
             motion_frame_counter_ = (motion_frame_counter_ + 1) % motion_frame_skip_;
 
-            bool motion = false;
             if (should_detect) {
                 motion = motion_detector_->detectMotion(static_cast<unsigned char*>(mapped_data), first_plane.length);
             } else {
@@ -1836,7 +1837,8 @@ public:
         }
 
         // JPEG encoding and output if enabled (with 300ms throttle to save CPU)
-        if (use_mjpeg_ && should_record) {
+        // if (use_mjpeg_ && should_record) {
+        if (motion && should_detect) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_jpeg_encode_time_);
 
@@ -2071,14 +2073,9 @@ private:
                 break;
         }
 
-        static bool first_time = true;
-        if (first_time) {
-            std::cout << "Initial FPS set to " << current_fps_ << " FPS" << std::endl;
-            first_time = false;
-            int64_t frame_time_us = 1000000 / current_fps_;
-            controls.set(controls::FrameDurationLimits,
-                        libcamera::Span<const int64_t, 2>({ frame_time_us, frame_time_us }));
-        }
+        int64_t frame_time_us = 1000000 / current_fps_;
+        controls.set(controls::FrameDurationLimits,
+                    libcamera::Span<const int64_t, 2>({ frame_time_us, frame_time_us }));
 
         return controls;
     }
@@ -2159,9 +2156,9 @@ int main(int argc, char *argv[]) {
         capturer.enableAutofocus(true);
         capturer.setFrameRate(30);  // 30 FPS
         capturer.enableMotionDetection(true); // Enable motion detection by default
-        capturer.setMotionFrameSkip(10); // Process every 10th frame
-        capturer.setMotionTailDuration(1); // Record for 1 second after motion stops
-        capturer.setJpegEncodeInterval(1000);  // 1000ms between JPEG encodes
+        capturer.setMotionFrameSkip(7); // Process every 7th frame
+        capturer.setMotionTailDuration(0); // Record for 0 seconds after motion stops
+        capturer.setJpegEncodeInterval(10);  // 10ms between JPEG encodes
 
         if (capturer.isH264Available()) {
             std::cout << "H.264 hardware encoder detected!" << std::endl;
