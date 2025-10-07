@@ -128,6 +128,68 @@ public:
 
         return response;
     }
+
+    // POST multipart/form-data with multiple files
+    Response postMultipartFiles(
+        const std::string& url,
+        const std::map<std::string, std::string>& fields,
+        const std::vector<std::pair<std::string, std::vector<unsigned char>>>& files, // field_name -> file_data
+        int timeout_ms = 30000
+    ) {
+        Response response;
+        CURL* curl = curl_easy_init();
+
+        if (!curl) {
+            std::cerr << "Failed to initialize CURL" << std::endl;
+            return response;
+        }
+
+        curl_mime* mime = curl_mime_init(curl);
+
+        // Add text fields
+        for (auto it = fields.begin(); it != fields.end(); ++it) {
+            curl_mimepart* part = curl_mime_addpart(mime);
+            curl_mime_name(part, it->first.c_str());
+            curl_mime_data(part, it->second.c_str(), CURL_ZERO_TERMINATED);
+        }
+
+        // Add multiple files
+        for (size_t i = 0; i < files.size(); ++i) {
+            const std::string& field_name = files[i].first;
+            const std::vector<unsigned char>& file_data = files[i].second;
+
+            curl_mimepart* file_part = curl_mime_addpart(mime);
+            curl_mime_name(file_part, field_name.c_str());
+            curl_mime_data(file_part, reinterpret_cast<const char*>(file_data.data()), file_data.size());
+            curl_mime_filename(file_part, ("photo" + std::to_string(i) + ".jpg").c_str());
+            curl_mime_type(file_part, "image/jpeg");
+        }
+
+        // Configure CURL
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+        // Perform request
+        CURLcode res = curl_easy_perform(curl);
+
+        if (res == CURLE_OK) {
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status_code);
+            response.success = (response.status_code >= 200 && response.status_code < 300);
+        } else {
+            std::cerr << "CURL error: " << curl_easy_strerror(res) << std::endl;
+            response.success = false;
+        }
+
+        // Cleanup
+        curl_mime_free(mime);
+        curl_easy_cleanup(curl);
+
+        return response;
+    }
 };
 
 // Telegram Bot API client
@@ -227,6 +289,74 @@ public:
         }
 
         return sendWithRetry("sendAnimation", fields, "animation", gif_data, "animation.gif");
+    }
+
+    // Send media group (2-10 photos/videos in one message)
+    bool sendMediaGroup(
+        const std::string& chat_id,
+        const std::vector<std::vector<unsigned char>>& photos,
+        const std::string& caption = std::string()
+    ) {
+        if (photos.empty() || photos.size() > 10) {
+            std::cerr << "Media group must contain 2-10 photos" << std::endl;
+            return false;
+        }
+
+        // Build media array in JSON format
+        std::string media_json = "[";
+        for (size_t i = 0; i < photos.size(); ++i) {
+            if (i > 0) media_json += ",";
+            media_json += "{\"type\":\"photo\",\"media\":\"attach://photo" + std::to_string(i) + "\"";
+            // Add caption only to first photo
+            if (i == 0 && !caption.empty()) {
+                // Escape quotes in caption
+                std::string escaped_caption = caption;
+                size_t pos = 0;
+                while ((pos = escaped_caption.find("\"", pos)) != std::string::npos) {
+                    escaped_caption.replace(pos, 1, "\\\"");
+                    pos += 2;
+                }
+                media_json += ",\"caption\":\"" + escaped_caption + "\"";
+            }
+            media_json += "}";
+        }
+        media_json += "]";
+
+        // Prepare fields
+        std::map<std::string, std::string> fields;
+        fields["chat_id"] = chat_id;
+        fields["media"] = media_json;
+
+        // Prepare files vector
+        std::vector<std::pair<std::string, std::vector<unsigned char>>> files;
+        for (size_t i = 0; i < photos.size(); ++i) {
+            files.push_back({"photo" + std::to_string(i), photos[i]});
+        }
+
+        // Send with retry logic
+        for (int attempt = 0; attempt < max_retries_; ++attempt) {
+            std::string url = base_url_ + "sendMediaGroup";
+
+            auto response = http_client_.postMultipartFiles(url, fields, files);
+
+            if (response.success) {
+                std::cout << "Telegram API: sendMediaGroup success (attempt "
+                         << (attempt + 1) << ")" << std::endl;
+                return true;
+            }
+
+            std::cerr << "Telegram API: sendMediaGroup failed (attempt "
+                     << (attempt + 1) << "/" << max_retries_ << "): "
+                     << "HTTP " << response.status_code << std::endl;
+
+            if (attempt < max_retries_ - 1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms_));
+            }
+        }
+
+        std::cerr << "Telegram API: sendMediaGroup failed after "
+                 << max_retries_ << " attempts" << std::endl;
+        return false;
     }
 };
 
@@ -1367,44 +1497,61 @@ private:
     std::unique_ptr<TelegramBotApi> bot_api_;
     std::string chat_id_;
 
-    // Async queue with frame dropping
-    std::queue<std::vector<unsigned char>> frame_queue_;
+    // Async queue with frame dropping (now stores vector of photos)
+    std::queue<std::vector<std::vector<unsigned char>>> message_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::thread worker_thread_;
     std::atomic<bool> running_{false};
 
-    size_t max_queue_size_ = 5;  // Drop oldest frames if queue grows beyond this
-    int frame_counter_ = 0;
+    size_t max_queue_size_ = 5;  // Drop oldest messages if queue grows beyond this
+    int message_counter_ = 0;
 
-    // Worker thread loop - processes frames from queue
+    // Worker thread loop - processes messages from queue
     void workerLoop() {
         while (running_) {
-            std::vector<unsigned char> frame_data;
+            std::vector<std::vector<unsigned char>> photos;
 
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);
                 queue_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
-                    return !frame_queue_.empty() || !running_;
+                    return !message_queue_.empty() || !running_;
                 });
 
-                if (!running_ && frame_queue_.empty()) {
+                if (!running_ && message_queue_.empty()) {
                     break;
                 }
 
-                if (!frame_queue_.empty()) {
-                    frame_data = std::move(frame_queue_.front());
-                    frame_queue_.pop();
+                if (!message_queue_.empty()) {
+                    photos = std::move(message_queue_.front());
+                    message_queue_.pop();
                 }
             }
 
-            if (!frame_data.empty()) {
-                // Send to Telegram with retry logic
-                bool success = bot_api_->sendPhoto(chat_id_, frame_data);
-                if (success) {
-                    std::cout << "Telegram: Frame " << frame_counter_++ << " sent successfully" << std::endl;
+            if (!photos.empty()) {
+                bool success = false;
+
+                if (photos.size() == 1) {
+                    // Send single photo
+                    success = bot_api_->sendPhoto(chat_id_, photos[0]);
+                    if (success) {
+                        std::cout << "Telegram: Photo " << message_counter_++ << " sent successfully" << std::endl;
+                    } else {
+                        std::cerr << "Telegram: Failed to send photo" << std::endl;
+                    }
+                } else if (photos.size() >= 2 && photos.size() <= 10) {
+                    // Send as media group (2-10 photos)
+                    success = bot_api_->sendMediaGroup(chat_id_, photos);
+                    if (success) {
+                        std::cout << "Telegram: Media group (" << photos.size()
+                                 << " photos) sent successfully" << std::endl;
+                        message_counter_++;
+                    } else {
+                        std::cerr << "Telegram: Failed to send media group" << std::endl;
+                    }
                 } else {
-                    std::cerr << "Telegram: Failed to send frame " << frame_counter_ << std::endl;
+                    std::cerr << "Telegram: Invalid photo count: " << photos.size()
+                             << " (must be 1-10)" << std::endl;
                 }
             }
         }
@@ -1447,19 +1594,38 @@ public:
         }
     }
 
-    void send(const std::vector<unsigned char>& data, bool is_keyframe = false) {
-        // Throttling is now handled in CapturerV2::processingFrameBuffer (before JPEG encoding)
+    // Send single photo or multiple photos as media group
+    // If photos.size() == 1: sends as single photo
+    // If photos.size() >= 2 && <= 10: sends as media group
+    void send(const std::vector<std::vector<unsigned char>>& photos, bool is_keyframe = false) {
+        if (photos.empty()) {
+            std::cerr << "Telegram: Cannot send empty photo vector" << std::endl;
+            return;
+        }
+
+        if (photos.size() > 10) {
+            std::cerr << "Telegram: Cannot send more than 10 photos at once (got "
+                     << photos.size() << ")" << std::endl;
+            return;
+        }
 
         std::lock_guard<std::mutex> lock(queue_mutex_);
 
-        // Drop oldest frame if queue is full
-        if (frame_queue_.size() >= max_queue_size_) {
-            frame_queue_.pop();
-            std::cout << "Telegram: Queue full, dropped oldest frame" << std::endl;
+        // Drop oldest message if queue is full
+        if (message_queue_.size() >= max_queue_size_) {
+            message_queue_.pop();
+            std::cout << "Telegram: Queue full, dropped oldest message" << std::endl;
         }
 
-        frame_queue_.push(data);
+        message_queue_.push(photos);
         queue_cv_.notify_one();
+    }
+
+    // Convenience method: send single photo
+    void sendSingle(const std::vector<unsigned char>& photo, bool is_keyframe = false) {
+        std::vector<std::vector<unsigned char>> photos;
+        photos.push_back(photo);
+        send(photos, is_keyframe);
     }
 };
 
@@ -1527,8 +1693,14 @@ private:
 public:
     explicit MjpegFrameHandler(std::shared_ptr<Sender> sender) : sender_(sender) {}
 
+    // Send single photo
     void operator()(const std::vector<unsigned char>& mjpeg_data) {
-        sender_->send(mjpeg_data);
+        sender_->sendSingle(mjpeg_data);
+    }
+
+    // Send multiple photos (media group)
+    void operator()(const std::vector<std::vector<unsigned char>>& photos) {
+        sender_->send(photos);
     }
 };
 
@@ -1589,6 +1761,11 @@ private:
     // JPEG encoding throttle (for Telegram sender)
     std::chrono::steady_clock::time_point last_jpeg_encode_time_;
     std::chrono::milliseconds jpeg_encode_interval_{300};  // Minimum 300ms between JPEG encodes
+
+    // Burst photo buffer for media group sending
+    std::vector<std::vector<unsigned char>> burst_photo_buffer_;
+    int burst_photo_target_ = 5;  // Collect 5 photos before sending
+    int burst_counter_ = 0;           // Burst photo counter
 
     // Camera resolution settings
     int width_ = 1920;
@@ -1791,7 +1968,7 @@ public:
         const FrameBuffer::Plane &first_plane = buffer->planes()[0];
 
         // Motion detection BEFORE encoding (using Y plane only)
-        bool should_record = true;
+        // bool should_record = true;
         bool motion = false;
         bool should_detect = false;
         if (motion_detector_ && first_plane.length >= 0) {
@@ -1801,27 +1978,29 @@ public:
 
             if (should_detect) {
                 motion = motion_detector_->detectMotion(static_cast<unsigned char*>(mapped_data), first_plane.length);
-            } else {
-                // Use last known motion state when skipping frames
-                motion = motion_detector_->isMotionDetected();
-            }
+            } 
+            // else {
+            //     // Use last known motion state when skipping frames
+            //     motion = motion_detector_->isMotionDetected();
+            // }
 
             if (motion) {
-                // Update last motion time
-                last_motion_time_ = std::chrono::steady_clock::now();
+            //     // Update last motion time
+            //     last_motion_time_ = std::chrono::steady_clock::now();
 
                 std::cout << "[MOTION] Detected! Level: " << std::fixed << std::setprecision(2)
                           << motion_detector_->getMotionLevel() << "%, Pixels: "
                           << motion_detector_->getMotionPixelCount() << std::endl;
-            } else {
-                // Check if we're still in the "tail" recording period
-                auto now = std::chrono::steady_clock::now();
-                auto time_since_motion = std::chrono::duration_cast<std::chrono::seconds>(now - last_motion_time_);
+            } 
+            // else {
+            //     // Check if we're still in the "tail" recording period
+            //     auto now = std::chrono::steady_clock::now();
+            //     auto time_since_motion = std::chrono::duration_cast<std::chrono::seconds>(now - last_motion_time_);
 
-                if (time_since_motion > motion_tail_duration_) {
-                    should_record = false;
-                }
-            }
+            //     if (time_since_motion > motion_tail_duration_) {
+            //         should_record = false;
+            //     }
+            // }
         }
 
         // Try H.264 encoding and output if enabled
@@ -1836,18 +2015,22 @@ public:
             }
         }
 
-        // JPEG encoding and output if enabled (with 300ms throttle to save CPU)
-        // if (use_mjpeg_ && should_record) {
-        if (motion && should_detect) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_jpeg_encode_time_);
+        // JPEG encoding and output if enabled
+        // Collect photos when motion is detected at should_detect intervals
+        if ((motion && should_detect && use_mjpeg_) || 
+                (burst_counter_ < burst_photo_target_ && burst_counter_ > 0 && use_mjpeg_)) {
+            burst_counter_ = (burst_counter_ + 1) % burst_photo_target_;
+            std::vector<unsigned char> jpeg_data;
+            if (jpeg_encoder_->encode(static_cast<unsigned char*>(mapped_data), total_yuv_size, jpeg_data)) {
+                // Add to burst buffer
+                burst_photo_buffer_.push_back(jpeg_data);
+                std::cout << "Burst buffer: " << burst_photo_buffer_.size() << "/" << burst_photo_target_ << std::endl;
 
-            if (elapsed >= jpeg_encode_interval_) {
-                last_jpeg_encode_time_ = now;
-
-                std::vector<unsigned char> jpeg_data;
-                if (jpeg_encoder_->encode(static_cast<unsigned char*>(mapped_data), total_yuv_size, jpeg_data)) {
-                    mjpeg_handler_(jpeg_data);
+                // Send when buffer is full
+                if (burst_photo_buffer_.size() >= static_cast<size_t>(burst_photo_target_)) {
+                    std::cout << "Sending burst of " << burst_photo_buffer_.size() << " photos" << std::endl;
+                    mjpeg_handler_(burst_photo_buffer_);
+                    burst_photo_buffer_.clear();
                 }
             }
         }
@@ -1997,6 +2180,20 @@ public:
         return static_cast<int>(jpeg_encode_interval_.count());
     }
 
+    void setBurstPhotoTarget(int count) {
+        if (count < 1 || count > 10) {
+            std::cerr << "Burst photo count must be 1-10, using default 5" << std::endl;
+            count = 5;
+        }
+        burst_photo_target_ = count;
+        burst_photo_buffer_.clear();
+        std::cout << "Burst photo target set to " << count << std::endl;
+    }
+
+    int getBurstPhotoTarget() const {
+        return burst_photo_target_;
+    }
+
     bool setH264GopSize(int gop_size) {
         if (!h264_encoder_) {
             std::cerr << "Set gop: H.264 encoder not available" << std::endl;
@@ -2112,7 +2309,7 @@ int main(int argc, char *argv[]) {
     try {
         // Read Telegram chat ID from environment or use default
         const char* chat_id_env = std::getenv("TELEGRAM_CHAT_ID");
-        std::string chat_id = chat_id_env ? chat_id_env : "YOUR_CHAT_ID";
+        std::string chat_id = chat_id_env ? chat_id_env : "123456789"; // Replace with your default chat ID
 
         auto sender_mjpeg = std::make_shared<TelegramSender>(chat_id);
         sender_mjpeg->start();  // Start worker thread
@@ -2156,9 +2353,9 @@ int main(int argc, char *argv[]) {
         capturer.enableAutofocus(true);
         capturer.setFrameRate(30);  // 30 FPS
         capturer.enableMotionDetection(true); // Enable motion detection by default
-        capturer.setMotionFrameSkip(7); // Process every 7th frame
+        capturer.setMotionFrameSkip(7); // Process every 7th frame (motion detection)
         capturer.setMotionTailDuration(0); // Record for 0 seconds after motion stops
-        capturer.setJpegEncodeInterval(10);  // 10ms between JPEG encodes
+        capturer.setBurstPhotoTarget(5);  // Collect 5 photos before sending as media group
 
         if (capturer.isH264Available()) {
             std::cout << "H.264 hardware encoder detected!" << std::endl;
