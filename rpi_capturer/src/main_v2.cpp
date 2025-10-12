@@ -634,9 +634,10 @@ public:
         ssize_t total_sent = 0;
         ssize_t data_size = data.size();
         while (total_sent < data_size) {
-            ssize_t sent = ::send(sockfd_, data.data() + total_sent, data_size - total_sent, 0);
+            // MSG_NOSIGNAL prevents SIGPIPE when connection is broken
+            ssize_t sent = ::send(sockfd_, data.data() + total_sent, data_size - total_sent, MSG_NOSIGNAL);
             if (sent < 0) {
-                std::cerr << "Failed to send data" << std::endl;
+                std::cerr << "Failed to send data: " << strerror(errno) << std::endl;
                 return false;
             }
             total_sent += sent;
@@ -1476,23 +1477,184 @@ private:
     }
 };
 
-class TcpBroadcastSender {
+// ============================================================================
+// Sender Interfaces
+// ============================================================================
+
+// Base interface for all senders
+class ISender {
+public:
+    virtual ~ISender() = default;
+    virtual void start() {}
+    virtual void stop() {}
+};
+
+// Interface for H.264 video senders (supports keyframe detection)
+class IH264Sender : public ISender {
+public:
+    virtual void send(const std::vector<unsigned char>& data, bool is_keyframe) = 0;
+};
+
+// Interface for MJPEG/Photo senders (no keyframe concept, supports single/group sending)
+class IMjpegSender : public ISender {
+public:
+    virtual void sendSingle(const std::vector<unsigned char>& photo) = 0;
+    virtual void sendGroup(const std::vector<std::vector<unsigned char>>& photos) = 0;
+};
+
+// ============================================================================
+// Composite Senders (Composite Pattern)
+// ============================================================================
+
+// Composite H.264 sender - aggregates multiple H.264 senders
+class CompositeH264Sender : public IH264Sender {
+private:
+    std::vector<std::shared_ptr<IH264Sender>> senders_;
+    std::mutex senders_mutex_;
+
+public:
+    CompositeH264Sender() = default;
+
+    // Add a sender to the composite
+    void addSender(std::shared_ptr<IH264Sender> sender) {
+        std::lock_guard<std::mutex> lock(senders_mutex_);
+        senders_.push_back(std::move(sender));
+    }
+
+    // Remove all senders
+    void clearSenders() {
+        std::lock_guard<std::mutex> lock(senders_mutex_);
+        senders_.clear();
+    }
+
+    // Send data to all senders
+    void send(const std::vector<unsigned char>& data, bool is_keyframe) override {
+        std::lock_guard<std::mutex> lock(senders_mutex_);
+        for (auto& sender : senders_) {
+            sender->send(data, is_keyframe);
+        }
+    }
+
+    // Start all senders
+    void start() override {
+        std::lock_guard<std::mutex> lock(senders_mutex_);
+        for (auto& sender : senders_) {
+            sender->start();
+        }
+    }
+
+    // Stop all senders
+    void stop() override {
+        std::lock_guard<std::mutex> lock(senders_mutex_);
+        for (auto& sender : senders_) {
+            sender->stop();
+        }
+    }
+
+    size_t getSenderCount() const {
+        return senders_.size();
+    }
+};
+
+// Composite MJPEG sender - aggregates multiple MJPEG senders
+class CompositeMjpegSender : public IMjpegSender {
+private:
+    std::vector<std::shared_ptr<IMjpegSender>> senders_;
+    std::mutex senders_mutex_;
+
+public:
+    CompositeMjpegSender() = default;
+
+    // Add a sender to the composite
+    void addSender(std::shared_ptr<IMjpegSender> sender) {
+        std::lock_guard<std::mutex> lock(senders_mutex_);
+        senders_.push_back(std::move(sender));
+    }
+
+    // Remove all senders
+    void clearSenders() {
+        std::lock_guard<std::mutex> lock(senders_mutex_);
+        senders_.clear();
+    }
+
+    // Send single photo to all senders
+    void sendSingle(const std::vector<unsigned char>& photo) override {
+        std::lock_guard<std::mutex> lock(senders_mutex_);
+        for (auto& sender : senders_) {
+            sender->sendSingle(photo);
+        }
+    }
+
+    // Send photo group to all senders
+    void sendGroup(const std::vector<std::vector<unsigned char>>& photos) override {
+        std::lock_guard<std::mutex> lock(senders_mutex_);
+        for (auto& sender : senders_) {
+            sender->sendGroup(photos);
+        }
+    }
+
+    // Start all senders
+    void start() override {
+        std::lock_guard<std::mutex> lock(senders_mutex_);
+        for (auto& sender : senders_) {
+            sender->start();
+        }
+    }
+
+    // Stop all senders
+    void stop() override {
+        std::lock_guard<std::mutex> lock(senders_mutex_);
+        for (auto& sender : senders_) {
+            sender->stop();
+        }
+    }
+
+    size_t getSenderCount() const {
+        return senders_.size();
+    }
+};
+
+// ============================================================================
+// Sender Implementations
+// ============================================================================
+
+// TcpBroadcastSender supports both H.264 and MJPEG formats via dual inheritance
+class TcpBroadcastSender : public IH264Sender, public IMjpegSender {
 private:
     std::unique_ptr<TcpBroadcaster> broadcaster_;
+
+    // Internal method for sending raw data
+    void sendRawData(const std::vector<unsigned char>& data, bool cache_as_keyframe = false) {
+        if (broadcaster_) {
+            broadcaster_->send(data, cache_as_keyframe);
+        }
+    }
 
 public:
     TcpBroadcastSender(int server_port, int max_clients = 5) {
         broadcaster_ = std::make_unique<TcpBroadcaster>(server_port, max_clients);
     }
 
-    void send(const std::vector<unsigned char>& data, bool is_keyframe = false) {
-        if (broadcaster_) {
-            broadcaster_->send(data, is_keyframe);
+    // IH264Sender interface implementation - send H.264 frames
+    void send(const std::vector<unsigned char>& data, bool is_keyframe) override {
+        sendRawData(data, is_keyframe);
+    }
+
+    // IMjpegSender interface implementation - send single MJPEG/JPEG
+    void sendSingle(const std::vector<unsigned char>& photo) override {
+        sendRawData(photo, false);
+    }
+
+    // IMjpegSender interface implementation - send photo group
+    void sendGroup(const std::vector<std::vector<unsigned char>>& photos) override {
+        // Send photos sequentially (TCP doesn't have native group concept)
+        for (const auto& photo : photos) {
+            sendRawData(photo, false);
         }
     }
 };
 
-class TelegramSender {
+class TelegramSender : public IMjpegSender {
 private:
     std::unique_ptr<TelegramBotApi> bot_api_;
     std::string chat_id_;
@@ -1575,7 +1737,7 @@ public:
         stop();
     }
 
-    void start() {
+    void start() override {
         if (!running_) {
             running_ = true;
             worker_thread_ = std::thread(&TelegramSender::workerLoop, this);
@@ -1583,7 +1745,7 @@ public:
         }
     }
 
-    void stop() {
+    void stop() override {
         if (running_) {
             running_ = false;
             queue_cv_.notify_all();
@@ -1594,10 +1756,14 @@ public:
         }
     }
 
-    // Send single photo or multiple photos as media group
-    // If photos.size() == 1: sends as single photo
-    // If photos.size() >= 2 && <= 10: sends as media group
-    void send(const std::vector<std::vector<unsigned char>>& photos, bool is_keyframe = false) {
+    // IMjpegSender interface implementation
+    void sendSingle(const std::vector<unsigned char>& photo) override {
+        std::vector<std::vector<unsigned char>> photos;
+        photos.push_back(photo);
+        sendGroup(photos);
+    }
+
+    void sendGroup(const std::vector<std::vector<unsigned char>>& photos) override {
         if (photos.empty()) {
             std::cerr << "Telegram: Cannot send empty photo vector" << std::endl;
             return;
@@ -1620,78 +1786,199 @@ public:
         message_queue_.push(photos);
         queue_cv_.notify_one();
     }
-
-    // Convenience method: send single photo
-    void sendSingle(const std::vector<unsigned char>& photo, bool is_keyframe = false) {
-        std::vector<std::vector<unsigned char>> photos;
-        photos.push_back(photo);
-        send(photos, is_keyframe);
-    }
 };
 
-class TcpSender {
+// TcpSender supports both H.264 and MJPEG formats via dual inheritance
+class TcpSender : public IH264Sender, public IMjpegSender {
 private:
     std::unique_ptr<TcpClient> tcp_client_;
-    bool first_frame_ = true;
+    std::string server_ip_;
+    int server_port_;
 
-public:
-    TcpSender(const std::string& server_ip, int server_port) {
-        tcp_client_ = std::make_unique<TcpClient>(server_ip, server_port);
-        if (!tcp_client_->connect()) {
-            std::cerr << "Warning: Failed to connect to TCP server" << std::endl;
-        }
-        std::cout << "TCP sender initialized successfully" << std::endl;
-    }
+    // Connection state
+    std::atomic<bool> connected_{false};
+    std::atomic<bool> first_frame_{true};
 
-    void send(const std::vector<unsigned char>& data, bool is_keyframe = false) {
-        // Note: is_keyframe is ignored for TcpSender (client mode)
-        // Keyframe caching is only used in TcpBroadcaster (server mode)
-        bool success = tcp_client_->sendData(data);
-        if (!success) {
-            std::cerr << "Failed to send data via TCP" << std::endl;
+    // Reconnection thread
+    std::thread reconnect_thread_;
+    std::atomic<bool> running_{false};
+    std::mutex connection_mutex_;
+
+    // Internal method for sending raw data
+    void sendRawData(const std::vector<unsigned char>& data) {
+        if (!connected_) {
+            // Silently skip if not connected (reconnection thread will handle it)
             return;
         }
+
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+
+        // Try to send data
+        bool success = tcp_client_->sendData(data);
+
+        if (!success) {
+            std::cerr << "TcpSender: Failed to send data, connection lost" << std::endl;
+            tcp_client_->disconnect();
+            connected_ = false;
+            return;
+        }
+
+        // Send first frame multiple times for better streaming start
         if (first_frame_) {
-            // Send first frame multiple times for better streaming start
             for (int i = 0; i < 3; ++i) {
                 success = tcp_client_->sendData(data);
+                if (!success) {
+                    std::cerr << "TcpSender: Failed to send first frame multiple times" << std::endl;
+                    tcp_client_->disconnect();
+                    connected_ = false;
+                    return;
+                }
             }
-            if (!success) {
-                std::cerr << "Failed to send first frame multiple times via TCP" << std::endl;
-            } else {
-                std::cout << "First frame sent multiple times via TCP for better start" << std::endl;
-            }
+            std::cout << "TcpSender: First frame sent multiple times for better start" << std::endl;
             first_frame_ = false;
         }
     }
+
+    // Reconnection logic
+    void reconnectionLoop() {
+        while (running_) {
+            if (!connected_) {
+                std::cout << "TcpSender: Attempting to connect to "
+                         << server_ip_ << ":" << server_port_ << "..." << std::endl;
+
+                std::lock_guard<std::mutex> lock(connection_mutex_);
+                if (tcp_client_->connect()) {
+                    connected_ = true;
+                    first_frame_ = true;
+                    std::cout << "TcpSender: Connected successfully!" << std::endl;
+                } else {
+                    std::cout << "TcpSender: Connection failed, retrying in 1 second..." << std::endl;
+                }
+            }
+
+            // Sleep for 1 second
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
+public:
+    TcpSender(const std::string& server_ip, int server_port)
+        : server_ip_(server_ip), server_port_(server_port) {
+
+        tcp_client_ = std::make_unique<TcpClient>(server_ip_, server_port_);
+
+        // Try initial connection
+        if (tcp_client_->connect()) {
+            connected_ = true;
+            std::cout << "TcpSender: Initial connection successful" << std::endl;
+        } else {
+            std::cout << "TcpSender: Initial connection failed, will retry in background" << std::endl;
+        }
+
+        // Start reconnection thread
+        running_ = true;
+        reconnect_thread_ = std::thread(&TcpSender::reconnectionLoop, this);
+    }
+
+    ~TcpSender() {
+        stop();
+    }
+
+    void stop() override {
+        if (running_) {
+            running_ = false;
+            if (reconnect_thread_.joinable()) {
+                reconnect_thread_.join();
+            }
+
+            std::lock_guard<std::mutex> lock(connection_mutex_);
+            if (tcp_client_) {
+                tcp_client_->disconnect();
+            }
+            connected_ = false;
+        }
+    }
+
+    // IH264Sender interface implementation - send H.264 frames
+    void send(const std::vector<unsigned char>& data, bool is_keyframe) override {
+        // Note: is_keyframe is ignored in TCP client mode (no caching)
+        // but could be used for future enhancements (e.g., prioritization)
+        sendRawData(data);
+    }
+
+    // IMjpegSender interface implementation - send single MJPEG/JPEG
+    void sendSingle(const std::vector<unsigned char>& photo) override {
+        sendRawData(photo);
+    }
+
+    // IMjpegSender interface implementation - send photo group
+    void sendGroup(const std::vector<std::vector<unsigned char>>& photos) override {
+        // Send photos sequentially (TCP doesn't have native group concept)
+        for (const auto& photo : photos) {
+            sendRawData(photo);
+        }
+    }
+
+    bool isConnected() const {
+        return connected_;
+    }
 };
 
-class FileSender {
+// H.264 file sender - saves H.264 frames to files
+class H264FileSender : public IH264Sender {
 private:
     std::string base_path_;
     std::string extension_;
     int frame_counter_ = 0;
 
 public:
-    FileSender(const std::string& path, const std::string& ext = ".dat")
+    H264FileSender(const std::string& path, const std::string& ext = ".h264")
         : base_path_(path), extension_(ext) {}
 
-    void send(const std::vector<unsigned char>& data, bool is_keyframe = false) {
-        // Note: is_keyframe can be used to save only keyframes if desired
+    void send(const std::vector<unsigned char>& data, bool is_keyframe) override {
+        // Optional: save only keyframes by checking is_keyframe
         std::string filename = base_path_ + "/frame_" + std::to_string(frame_counter_++) + extension_;
         std::ofstream file(filename, std::ios::binary);
         file.write(reinterpret_cast<const char*>(data.data()), data.size());
     }
 };
 
-// Frame handler layer classes
-template<typename Sender>
-class MjpegFrameHandler {
+// MJPEG file sender - saves JPEG images to files
+class MjpegFileSender : public IMjpegSender {
 private:
-    std::shared_ptr<Sender> sender_;
+    std::string base_path_;
+    std::string extension_;
+    int frame_counter_ = 0;
 
 public:
-    explicit MjpegFrameHandler(std::shared_ptr<Sender> sender) : sender_(sender) {}
+    MjpegFileSender(const std::string& path, const std::string& ext = ".jpg")
+        : base_path_(path), extension_(ext) {}
+
+    void sendSingle(const std::vector<unsigned char>& photo) override {
+        std::string filename = base_path_ + "/photo_" + std::to_string(frame_counter_++) + extension_;
+        std::ofstream file(filename, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(photo.data()), photo.size());
+    }
+
+    void sendGroup(const std::vector<std::vector<unsigned char>>& photos) override {
+        // Save each photo in the group
+        for (const auto& photo : photos) {
+            sendSingle(photo);
+        }
+    }
+};
+
+// ============================================================================
+// Frame Handlers
+// ============================================================================
+
+// Handler for MJPEG frames - uses IMjpegSender interface
+class MjpegFrameHandler {
+private:
+    std::shared_ptr<IMjpegSender> sender_;
+
+public:
+    explicit MjpegFrameHandler(std::shared_ptr<IMjpegSender> sender) : sender_(sender) {}
 
     // Send single photo
     void operator()(const std::vector<unsigned char>& mjpeg_data) {
@@ -1700,24 +1987,23 @@ public:
 
     // Send multiple photos (media group)
     void operator()(const std::vector<std::vector<unsigned char>>& photos) {
-        sender_->send(photos);
+        sender_->sendGroup(photos);
     }
 };
 
-template<typename Sender>
+// Handler for H.264 frames - uses IH264Sender interface
 class H264FrameHandler {
 private:
-    std::shared_ptr<Sender> sender_;
+    std::shared_ptr<IH264Sender> sender_;
 
 public:
-    explicit H264FrameHandler(std::shared_ptr<Sender> sender) : sender_(sender) {}
+    explicit H264FrameHandler(std::shared_ptr<IH264Sender> sender) : sender_(sender) {}
 
-    void operator()(const std::vector<unsigned char>& h264_data, bool is_keyframe = false) {
+    void operator()(const std::vector<unsigned char>& h264_data, bool is_keyframe) {
         sender_->send(h264_data, is_keyframe);
     }
 };
 
-template<typename MjpegHandler, typename H264Handler>
 class CapturerV2 {
 private:
     std::unique_ptr<CameraManager> cm_;
@@ -1727,8 +2013,8 @@ private:
     std::vector<std::unique_ptr<Request>> requests_;
 
     // Frame handlers
-    MjpegHandler mjpeg_handler_;
-    H264Handler h264_handler_;
+    MjpegFrameHandler mjpeg_handler_;
+    H264FrameHandler h264_handler_;
 
     // Encoders
     std::unique_ptr<JpegEncoder> jpeg_encoder_;
@@ -1783,7 +2069,7 @@ private:
     } af_settings_;
 
 public:
-    CapturerV2(MjpegHandler mjpeg_handler, H264Handler h264_handler, int width = 1920, int height = 1080)
+    CapturerV2(MjpegFrameHandler mjpeg_handler, H264FrameHandler h264_handler, int width = 1920, int height = 1080)
         : cm_(std::make_unique<CameraManager>()),
           mjpeg_handler_(std::move(mjpeg_handler)),
           h264_handler_(std::move(h264_handler)),
@@ -2300,39 +2586,111 @@ public:
 int main(int argc, char *argv[]) {
     std::cout << "Camera Module v3 + Pi Zero 2W + libcamera" << std::endl;
 
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << "connect <server_ip> <server_port>" << std::endl;
-        std::cerr << "       " << argv[0] << "accept <server_port> [max_clients]" << std::endl;
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <broadcast_port> [remote_ip] [remote_port] [max_clients]" << std::endl;
+        std::cerr << "Example: " << argv[0] << " 8554" << std::endl;
+        std::cerr << "         " << argv[0] << " 8554 192.168.1.100 8555 5" << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "Environment variables:" << std::endl;
+        std::cerr << "  TELEGRAM_CHAT_ID     - Telegram chat ID for photo sending" << std::endl;
+        std::cerr << "  TELEGRAM_BOT_TOKEN   - Telegram bot token" << std::endl;
+        std::cerr << "  TCP_FORMAT           - Format for TCP senders: 'h264' or 'mjpeg' (default: h264)" << std::endl;
         return -1;
     }
 
     try {
-        // Read Telegram chat ID from environment or use default
+        // ========================================================================
+        // Determine TCP format from environment variable
+        // ========================================================================
+        const char* tcp_format_env = std::getenv("TCP_FORMAT");
+        std::string tcp_format = tcp_format_env ? tcp_format_env : "h264";
+        bool use_h264_for_tcp = (tcp_format == "h264");
+
+        std::cout << "TCP Format: " << (use_h264_for_tcp ? "H.264" : "MJPEG") << std::endl;
+
+        // ========================================================================
+        // Setup MJPEG Sender (Telegram)
+        // ========================================================================
         const char* chat_id_env = std::getenv("TELEGRAM_CHAT_ID");
-        std::string chat_id = chat_id_env ? chat_id_env : "123456789"; // Replace with your default chat ID
+        std::string chat_id = chat_id_env ? chat_id_env : "123456789";
 
-        auto sender_mjpeg = std::make_shared<TelegramSender>(chat_id);
-        sender_mjpeg->start();  // Start worker thread
+        auto telegram_sender = std::make_shared<TelegramSender>(chat_id);
+        telegram_sender->start();
 
-        MjpegFrameHandler<TelegramSender> mjpeg_handler(sender_mjpeg);
+        // ========================================================================
+        // Setup TCP Senders (Broadcaster + Client)
+        // ========================================================================
+        int broadcast_port = std::stoi(argv[1]);
+        int max_clients = (argc >= 5) ? std::stoi(argv[4]) : 5;
 
-        // if (std::string(argv[1]) != "connect" && std::string(argv[1]) != "accept") {
-        //     std::cerr << "Invalid mode. Use 'connect' or 'accept'." << std::endl;
-        //     return -1;
-        // }
-        // if (std::string(argv[1]) == "client") {
-        //     TcpSender tcp_sender_h264(std::string(argv[1]), std::stoi(argv[2])); // Different port
-        //     H264FrameHandler<TcpSender> h264_handler(std::move(tcp_sender_h264));
-        // } else {
-            int max_clients = 5;
-            if (argc >= 4) {
-                max_clients = std::stoi(argv[3]);
+        // Create TCP broadcaster
+        auto tcp_broadcaster = std::make_shared<TcpBroadcastSender>(broadcast_port, max_clients);
+        std::cout << "Added TCP Broadcaster on port " << broadcast_port
+                  << " (max clients: " << max_clients << ")" << std::endl;
+
+        // Create TCP client if remote server specified
+        std::shared_ptr<TcpSender> tcp_client;
+        if (argc >= 4) {
+            std::string remote_ip = argv[2];
+            int remote_port = std::stoi(argv[3]);
+            tcp_client = std::make_shared<TcpSender>(remote_ip, remote_port);
+            std::cout << "Added TCP Client connecting to " << remote_ip
+                      << ":" << remote_port << std::endl;
+        }
+
+        // ========================================================================
+        // Create handlers based on selected format
+        // ========================================================================
+        MjpegFrameHandler mjpeg_handler(telegram_sender);
+        H264FrameHandler h264_handler(nullptr);
+
+        if (use_h264_for_tcp) {
+            // H.264 format for TCP
+            auto composite_h264 = std::make_shared<CompositeH264Sender>();
+
+            // Cast to IH264Sender and add to composite
+            std::shared_ptr<IH264Sender> h264_broadcaster = tcp_broadcaster;
+            composite_h264->addSender(h264_broadcaster);
+
+            if (tcp_client) {
+                std::shared_ptr<IH264Sender> h264_client = tcp_client;
+                composite_h264->addSender(h264_client);
             }
-            auto tcp_broadcaster = std::make_shared<TcpBroadcastSender>(std::stoi(argv[2]), max_clients);
-            H264FrameHandler<TcpBroadcastSender> h264_handler(tcp_broadcaster);
-        // }
 
-        // Regular capturer (always encoding)
+            std::cout << "H.264 Composite Sender configured with "
+                      << composite_h264->getSenderCount() << " sender(s)" << std::endl;
+
+            h264_handler = H264FrameHandler(composite_h264);
+
+        } else {
+            // MJPEG format for TCP
+            auto composite_mjpeg = std::make_shared<CompositeMjpegSender>();
+
+            // Add Telegram sender
+            composite_mjpeg->addSender(telegram_sender);
+
+            // Cast to IMjpegSender and add to composite
+            std::shared_ptr<IMjpegSender> mjpeg_broadcaster = tcp_broadcaster;
+            composite_mjpeg->addSender(mjpeg_broadcaster);
+
+            if (tcp_client) {
+                std::shared_ptr<IMjpegSender> mjpeg_client = tcp_client;
+                composite_mjpeg->addSender(mjpeg_client);
+            }
+
+            std::cout << "MJPEG Composite Sender configured with "
+                      << composite_mjpeg->getSenderCount() << " sender(s)" << std::endl;
+
+            mjpeg_handler = MjpegFrameHandler(composite_mjpeg);
+
+            // Create empty H.264 handler (won't be used)
+            auto empty_h264 = std::make_shared<CompositeH264Sender>();
+            h264_handler = H264FrameHandler(empty_h264);
+        }
+
+        // ========================================================================
+        // Create and configure capturer
+        // ========================================================================
         CapturerV2 capturer(std::move(mjpeg_handler), std::move(h264_handler), 1920, 1080);
 
         if (!capturer.initialize()) {
