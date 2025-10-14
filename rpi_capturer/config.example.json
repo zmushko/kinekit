@@ -1,0 +1,58 @@
+{
+  "camera": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 30
+  },
+
+  "autofocus": {
+    "enabled": true,
+    "mode": 2,
+    "speed": 1,
+    "range": 2
+  },
+
+  "motion_detection": {
+    "enabled": true,
+    "frame_skip": 7,
+    "tail_duration": 0
+  },
+
+  "mjpeg": {
+    "enabled": true,
+    "output_enabled": true,
+    "encode_interval_ms": 300,
+    "burst_photo_count": 5
+  },
+
+  "h264": {
+    "enabled": true,
+    "output_enabled": true,
+    "gop_size": 60,
+    "bitrate": 5000000,
+    "cbr": false,
+    "sps_pps_repeat": true
+  },
+
+  "telegram": {
+    "enabled": true,
+    "bot_token": "YOUR_BOT_TOKEN_HERE",
+    "chat_id": "YOUR_CHAT_ID_HERE",
+    "max_queue_size": 5
+  },
+
+  "tcp": {
+    "format": "h264",
+    "broadcast": {
+      "enabled": true,
+      "port": 8554,
+      "max_clients": 5
+    },
+    "client": {
+      "enabled": false,
+      "remote_ip": "10.0.0.2",
+      "remote_port": 9999,
+      "reconnect_interval_sec": 1
+    }
+  }
+}

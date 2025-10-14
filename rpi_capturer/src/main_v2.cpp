@@ -26,6 +26,7 @@
 #include <queue>
 #include <condition_variable>
 #include <atomic>
+#include <nlohmann/json.hpp>
 
 // ARM NEON intrinsics for SIMD optimization
 #ifdef __ARM_NEON
@@ -33,6 +34,7 @@
 #endif
 
 using namespace libcamera;
+using json = nlohmann::json;
 
 // V4L2 Control IDs for video encoder
 namespace V4L2Controls {
@@ -44,6 +46,200 @@ namespace V4L2Controls {
         BITRATE = 0x009909cf             // V4L2_ID_MPEG_VIDEO_BITRATE
     };
 }
+
+// ============================================================================
+// Configuration Management
+// ============================================================================
+
+class Config {
+public:
+    // Camera settings
+    struct Camera {
+        int width = 1920;
+        int height = 1080;
+        int fps = 30;
+    } camera;
+
+    // Autofocus settings
+    struct Autofocus {
+        bool enabled = true;
+        int mode = 2;      // 0=Auto, 1=Manual, 2=Continuous
+        int speed = 1;     // 0=Normal, 1=Fast
+        int range = 2;     // 0=Normal, 1=Macro, 2=Full
+    } autofocus;
+
+    // Motion detection settings
+    struct MotionDetection {
+        bool enabled = true;
+        int frame_skip = 7;
+        int tail_duration = 0;
+    } motion_detection;
+
+    // MJPEG settings
+    struct Mjpeg {
+        bool enabled = true;
+        bool output_enabled = true;
+        int encode_interval_ms = 300;
+        int burst_photo_count = 5;
+    } mjpeg;
+
+    // H.264 settings
+    struct H264 {
+        bool enabled = true;
+        bool output_enabled = true;
+        int gop_size = 60;
+        int bitrate = 5000000;
+        bool cbr = false;
+        bool sps_pps_repeat = true;
+    } h264;
+
+    // Telegram settings
+    struct Telegram {
+        bool enabled = true;
+        std::string bot_token = "";
+        std::string chat_id = "";
+        int max_queue_size = 5;
+    } telegram;
+
+    // TCP settings
+    struct Tcp {
+        std::string format = "h264";  // "h264" or "mjpeg"
+
+        struct Broadcast {
+            bool enabled = true;
+            int port = 8554;
+            int max_clients = 5;
+        } broadcast;
+
+        struct Client {
+            bool enabled = false;
+            std::string remote_ip = "10.0.0.2";
+            int remote_port = 9999;
+            int reconnect_interval_sec = 1;
+        } client;
+    } tcp;
+
+    // Load configuration from JSON file
+    static Config load(const std::string& filename) {
+        Config config;
+
+        try {
+            std::ifstream file(filename);
+            if (!file.is_open()) {
+                std::cerr << "Config file '" << filename << "' not found, using defaults" << std::endl;
+                return config;
+            }
+
+            json j;
+            file >> j;
+
+            // Camera
+            if (j.contains("camera")) {
+                auto& cam = j["camera"];
+                config.camera.width = cam.value("width", config.camera.width);
+                config.camera.height = cam.value("height", config.camera.height);
+                config.camera.fps = cam.value("fps", config.camera.fps);
+            }
+
+            // Autofocus
+            if (j.contains("autofocus")) {
+                auto& af = j["autofocus"];
+                config.autofocus.enabled = af.value("enabled", config.autofocus.enabled);
+                config.autofocus.mode = af.value("mode", config.autofocus.mode);
+                config.autofocus.speed = af.value("speed", config.autofocus.speed);
+                config.autofocus.range = af.value("range", config.autofocus.range);
+            }
+
+            // Motion detection
+            if (j.contains("motion_detection")) {
+                auto& md = j["motion_detection"];
+                config.motion_detection.enabled = md.value("enabled", config.motion_detection.enabled);
+                config.motion_detection.frame_skip = md.value("frame_skip", config.motion_detection.frame_skip);
+                config.motion_detection.tail_duration = md.value("tail_duration", config.motion_detection.tail_duration);
+            }
+
+            // MJPEG
+            if (j.contains("mjpeg")) {
+                auto& mjpeg = j["mjpeg"];
+                config.mjpeg.enabled = mjpeg.value("enabled", config.mjpeg.enabled);
+                config.mjpeg.output_enabled = mjpeg.value("output_enabled", config.mjpeg.output_enabled);
+                config.mjpeg.encode_interval_ms = mjpeg.value("encode_interval_ms", config.mjpeg.encode_interval_ms);
+                config.mjpeg.burst_photo_count = mjpeg.value("burst_photo_count", config.mjpeg.burst_photo_count);
+            }
+
+            // H.264
+            if (j.contains("h264")) {
+                auto& h264 = j["h264"];
+                config.h264.enabled = h264.value("enabled", config.h264.enabled);
+                config.h264.output_enabled = h264.value("output_enabled", config.h264.output_enabled);
+                config.h264.gop_size = h264.value("gop_size", config.h264.gop_size);
+                config.h264.bitrate = h264.value("bitrate", config.h264.bitrate);
+                config.h264.cbr = h264.value("cbr", config.h264.cbr);
+                config.h264.sps_pps_repeat = h264.value("sps_pps_repeat", config.h264.sps_pps_repeat);
+            }
+
+            // Telegram
+            if (j.contains("telegram")) {
+                auto& tg = j["telegram"];
+                config.telegram.enabled = tg.value("enabled", config.telegram.enabled);
+                config.telegram.bot_token = tg.value("bot_token", config.telegram.bot_token);
+                config.telegram.chat_id = tg.value("chat_id", config.telegram.chat_id);
+                config.telegram.max_queue_size = tg.value("max_queue_size", config.telegram.max_queue_size);
+            }
+
+            // TCP
+            if (j.contains("tcp")) {
+                auto& tcp = j["tcp"];
+                config.tcp.format = tcp.value("format", config.tcp.format);
+
+                if (tcp.contains("broadcast")) {
+                    auto& bc = tcp["broadcast"];
+                    config.tcp.broadcast.enabled = bc.value("enabled", config.tcp.broadcast.enabled);
+                    config.tcp.broadcast.port = bc.value("port", config.tcp.broadcast.port);
+                    config.tcp.broadcast.max_clients = bc.value("max_clients", config.tcp.broadcast.max_clients);
+                }
+
+                if (tcp.contains("client")) {
+                    auto& cl = tcp["client"];
+                    config.tcp.client.enabled = cl.value("enabled", config.tcp.client.enabled);
+                    config.tcp.client.remote_ip = cl.value("remote_ip", config.tcp.client.remote_ip);
+                    config.tcp.client.remote_port = cl.value("remote_port", config.tcp.client.remote_port);
+                    config.tcp.client.reconnect_interval_sec = cl.value("reconnect_interval_sec", config.tcp.client.reconnect_interval_sec);
+                }
+            }
+
+            std::cout << "Configuration loaded from '" << filename << "'" << std::endl;
+
+        } catch (const std::exception& e) {
+            std::cerr << "Error loading config: " << e.what() << std::endl;
+            std::cerr << "Using default configuration" << std::endl;
+        }
+
+        return config;
+    }
+
+    // Print configuration summary
+    void print() const {
+        std::cout << "\n========== Configuration Summary ==========" << std::endl;
+        std::cout << "Camera: " << camera.width << "x" << camera.height << " @ " << camera.fps << " FPS" << std::endl;
+        std::cout << "Autofocus: " << (autofocus.enabled ? "enabled" : "disabled") << std::endl;
+        std::cout << "Motion Detection: " << (motion_detection.enabled ? "enabled" : "disabled")
+                  << " (skip=" << motion_detection.frame_skip << ")" << std::endl;
+        std::cout << "MJPEG: " << (mjpeg.enabled ? "enabled" : "disabled")
+                  << " (burst=" << mjpeg.burst_photo_count << ")" << std::endl;
+        std::cout << "H.264: " << (h264.enabled ? "enabled" : "disabled")
+                  << " (bitrate=" << h264.bitrate << ", gop=" << h264.gop_size << ")" << std::endl;
+        std::cout << "Telegram: " << (telegram.enabled ? "enabled" : "disabled") << std::endl;
+        std::cout << "TCP Format: " << tcp.format << std::endl;
+        std::cout << "TCP Broadcast: " << (tcp.broadcast.enabled ? "enabled" : "disabled")
+                  << " (port=" << tcp.broadcast.port << ")" << std::endl;
+        std::cout << "TCP Client: " << (tcp.client.enabled ? "enabled" : "disabled");
+        if (tcp.client.enabled) {
+            std::cout << " (" << tcp.client.remote_ip << ":" << tcp.client.remote_port << ")";
+        }
+        std::cout << "\n==========================================\n" << std::endl;
+    }
+};
 
 // HTTP Client - wrapper around libcurl for multipart/form-data POST requests
 class HttpClient {
@@ -733,6 +929,7 @@ private:
     int gop_size_;  // GOP size (keyframe interval)
     int bitrate_;   // Bitrate in bps
     bool initialized_;
+    bool sps_pps_repeat_enabled_;  // Enable SPS/PPS repeat for better streaming
 
     // V4L2 M2M structures
     struct v4l2_format input_format_;
@@ -748,9 +945,9 @@ private:
     size_t output_buffer_size_;
 
 public:
-    H264Encoder(int width, int height, int gop_size = 30, int bitrate = 10000000)
+    H264Encoder(int width, int height, int gop_size = 30, int bitrate = 10000000, bool sps_pps_repeat = true)
         : encoder_fd_(-1), width_(width), height_(height), gop_size_(gop_size), bitrate_(bitrate),
-          initialized_(false), formats_set_(false),
+          initialized_(false), sps_pps_repeat_enabled_(sps_pps_repeat), formats_set_(false),
           streaming_started_(false), first_frame_(true), output_mem_(nullptr), output_buffer_size_(0) {
         memset(&input_format_, 0, sizeof(input_format_));
         memset(&output_format_, 0, sizeof(output_format_));
@@ -960,9 +1157,15 @@ private:
             std::cerr << "Failed to set GOP size after streaming start" << std::endl;
         }
 
-        // Enable SPS/PPS repeat with each I-frame for better streaming compatibility
-        if (!enableSPSPPSRepeat(true)) {
-            std::cerr << "Failed to enable SPS/PPS repeat after streaming start" << std::endl;
+        // Enable SPS/PPS repeat with each I-frame for better streaming compatibility (if configured)
+        if (sps_pps_repeat_enabled_) {
+            if (!enableSPSPPSRepeat(true)) {
+                std::cerr << "Failed to enable SPS/PPS repeat after streaming start" << std::endl;
+            } else {
+                std::cout << "SPS/PPS repeat enabled" << std::endl;
+            }
+        } else {
+            std::cout << "SPS/PPS repeat disabled by configuration" << std::endl;
         }
 
         return true;
@@ -1666,7 +1869,7 @@ private:
     std::thread worker_thread_;
     std::atomic<bool> running_{false};
 
-    size_t max_queue_size_ = 5;  // Drop oldest messages if queue grows beyond this
+    size_t max_queue_size_;  // Drop oldest messages if queue grows beyond this
     int message_counter_ = 0;
 
     // Worker thread loop - processes messages from queue
@@ -1722,15 +1925,12 @@ private:
     }
 
 public:
-    TelegramSender(const std::string& chat_id) : chat_id_(chat_id) {
-        // Read bot token from environment
-        const char* token = std::getenv("TELEGRAM_BOT_TOKEN");
-        if (!token) {
-            throw std::runtime_error("TELEGRAM_BOT_TOKEN environment variable not set");
-        }
+    TelegramSender(const std::string& bot_token, const std::string& chat_id, size_t max_queue_size = 5)
+        : chat_id_(chat_id), max_queue_size_(max_queue_size) {
 
-        bot_api_ = std::make_unique<TelegramBotApi>(token);
-        std::cout << "TelegramSender initialized (chat_id: " << chat_id_ << ")" << std::endl;
+        bot_api_ = std::make_unique<TelegramBotApi>(bot_token);
+        std::cout << "TelegramSender initialized (chat_id: " << chat_id_
+                  << ", max_queue_size: " << max_queue_size_ << ")" << std::endl;
     }
 
     ~TelegramSender() {
@@ -1794,6 +1994,7 @@ private:
     std::unique_ptr<TcpClient> tcp_client_;
     std::string server_ip_;
     int server_port_;
+    int reconnect_interval_sec_;
 
     // Connection state
     std::atomic<bool> connected_{false};
@@ -1852,20 +2053,21 @@ private:
                     first_frame_ = true;
                     std::cout << "TcpSender: Connected successfully!" << std::endl;
                 } else {
-                    std::cout << "TcpSender: Connection failed, retrying in 1 second..." << std::endl;
+                    std::cout << "TcpSender: Connection failed, retrying in " << reconnect_interval_sec_ << " second(s)..." << std::endl;
                 }
             }
 
-            // Sleep for 1 second
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            // Sleep for configured interval
+            std::this_thread::sleep_for(std::chrono::seconds(reconnect_interval_sec_));
         }
     }
 
 public:
-    TcpSender(const std::string& server_ip, int server_port)
-        : server_ip_(server_ip), server_port_(server_port) {
+    TcpSender(const std::string& server_ip, int server_port, int reconnect_interval_sec = 1)
+        : server_ip_(server_ip), server_port_(server_port), reconnect_interval_sec_(reconnect_interval_sec) {
 
         tcp_client_ = std::make_unique<TcpClient>(server_ip_, server_port_);
+        std::cout << "TcpSender initialized (reconnect_interval: " << reconnect_interval_sec_ << "s)" << std::endl;
 
         // Try initial connection
         if (tcp_client_->connect()) {
@@ -1972,22 +2174,52 @@ public:
 // Frame Handlers
 // ============================================================================
 
-// Handler for MJPEG frames - uses IMjpegSender interface
+// Handler for MJPEG frames - supports separate Telegram (burst) and TCP (streaming) senders
 class MjpegFrameHandler {
 private:
-    std::shared_ptr<IMjpegSender> sender_;
+    std::shared_ptr<IMjpegSender> telegram_sender_;  // For burst mode (Telegram)
+    std::shared_ptr<IMjpegSender> tcp_sender_;       // For streaming mode (TCP)
 
 public:
-    explicit MjpegFrameHandler(std::shared_ptr<IMjpegSender> sender) : sender_(sender) {}
+    // Constructor with separate senders
+    explicit MjpegFrameHandler(
+        std::shared_ptr<IMjpegSender> telegram_sender,
+        std::shared_ptr<IMjpegSender> tcp_sender = nullptr
+    ) : telegram_sender_(telegram_sender), tcp_sender_(tcp_sender) {}
 
-    // Send single photo
+    // Backward compatibility - send single photo to Telegram
     void operator()(const std::vector<unsigned char>& mjpeg_data) {
-        sender_->sendSingle(mjpeg_data);
+        sendToTelegram(mjpeg_data);
     }
 
-    // Send multiple photos (media group)
+    // Backward compatibility - send photo group to Telegram
     void operator()(const std::vector<std::vector<unsigned char>>& photos) {
-        sender_->sendGroup(photos);
+        sendBurstToTelegram(photos);
+    }
+
+    // Send single JPEG frame to TCP (streaming mode)
+    void sendToTcp(const std::vector<unsigned char>& jpeg_data) {
+        if (tcp_sender_) {
+            tcp_sender_->sendSingle(jpeg_data);
+        }
+    }
+
+    // Send burst (photo group) to Telegram
+    void sendBurstToTelegram(const std::vector<std::vector<unsigned char>>& photos) {
+        if (telegram_sender_) {
+            telegram_sender_->sendGroup(photos);
+        }
+    }
+
+    // Send single photo to Telegram
+    void sendToTelegram(const std::vector<unsigned char>& jpeg_data) {
+        if (telegram_sender_) {
+            telegram_sender_->sendSingle(jpeg_data);
+        }
+    }
+
+    bool hasTcpSender() const {
+        return tcp_sender_ != nullptr;
     }
 };
 
@@ -2024,6 +2256,9 @@ private:
     // Output format control
     bool use_mjpeg_ = true;
     bool use_h264_output_ = false;
+
+    // TCP format selection (true = H.264, false = MJPEG)
+    bool tcp_uses_h264_ = true;
 
     // Motion detection
     std::unique_ptr<MotionDetector> motion_detector_;
@@ -2069,7 +2304,9 @@ private:
     } af_settings_;
 
 public:
-    CapturerV2(MjpegFrameHandler mjpeg_handler, H264FrameHandler h264_handler, int width = 1920, int height = 1080)
+    CapturerV2(MjpegFrameHandler mjpeg_handler, H264FrameHandler h264_handler,
+               int width = 1920, int height = 1080,
+               int h264_gop_size = 60, int h264_bitrate = 5000000, bool h264_sps_pps_repeat = true)
         : cm_(std::make_unique<CameraManager>()),
           mjpeg_handler_(std::move(mjpeg_handler)),
           h264_handler_(std::move(h264_handler)),
@@ -2080,7 +2317,7 @@ public:
 
         // Initialize encoders
         jpeg_encoder_ = std::make_unique<JpegEncoder>(width_, height_, 90); // Quality=90
-        h264_encoder_ = std::make_unique<H264Encoder>(width_, height_, 60, 5000000); // GOP=60, Bitrate=5Mbps
+        h264_encoder_ = std::make_unique<H264Encoder>(width_, height_, h264_gop_size, h264_bitrate, h264_sps_pps_repeat);
 
         // Initialize motion detector
         motion_detector_ = std::make_unique<MotionDetector>(width_, height_, 4); // Downsample factor 4
@@ -2253,6 +2490,15 @@ public:
         }
         const FrameBuffer::Plane &first_plane = buffer->planes()[0];
 
+        // You can now check TCP format inside this method:
+        // if (tcp_uses_h264_) {
+        //     // Logic specific to H.264 TCP format
+        // } else {
+        //     // Logic specific to MJPEG TCP format
+        // }
+        // Or use: getTcpFormat() returns "H.264" or "MJPEG"
+        // Or use: isTcpFormatH264() returns true/false
+
         // Motion detection BEFORE encoding (using Y plane only)
         // bool should_record = true;
         bool motion = false;
@@ -2303,10 +2549,10 @@ public:
 
         // JPEG encoding and output if enabled
         // Collect photos when motion is detected at should_detect intervals
+        std::vector<unsigned char> jpeg_data = {};
         if ((motion && should_detect && use_mjpeg_) || 
                 (burst_counter_ < burst_photo_target_ && burst_counter_ > 0 && use_mjpeg_)) {
             burst_counter_ = (burst_counter_ + 1) % burst_photo_target_;
-            std::vector<unsigned char> jpeg_data;
             if (jpeg_encoder_->encode(static_cast<unsigned char*>(mapped_data), total_yuv_size, jpeg_data)) {
                 // Add to burst buffer
                 burst_photo_buffer_.push_back(jpeg_data);
@@ -2314,12 +2560,21 @@ public:
 
                 // Send when buffer is full
                 if (burst_photo_buffer_.size() >= static_cast<size_t>(burst_photo_target_)) {
-                    std::cout << "Sending burst of " << burst_photo_buffer_.size() << " photos" << std::endl;
-                    mjpeg_handler_(burst_photo_buffer_);
+                    std::cout << "Sending burst of " << burst_photo_buffer_.size() << " photos to Telegram" << std::endl;
+                    mjpeg_handler_.sendBurstToTelegram(burst_photo_buffer_);
                     burst_photo_buffer_.clear();
                 }
             }
         }
+
+        // MJPEG TCP streaming - send every frame to TCP
+        if (!tcp_uses_h264_ && mjpeg_handler_.hasTcpSender()) {
+            // Reuse already encoded JPEG if available, otherwise encode new one
+            if (!jpeg_data.empty() || jpeg_encoder_->encode(static_cast<unsigned char*>(mapped_data), total_yuv_size, jpeg_data)) {
+                mjpeg_handler_.sendToTcp(jpeg_data);
+            }
+        }
+
         munmap(mapped_data, total_yuv_size);
     }
 
@@ -2395,6 +2650,20 @@ public:
     void enableH264Output(bool enable) {
         use_h264_output_ = enable;
         std::cout << "H.264 output " << (enable ? "enabled" : "disabled") << std::endl;
+    }
+
+    // TCP format control
+    void setTcpFormat(bool use_h264) {
+        tcp_uses_h264_ = use_h264;
+        std::cout << "TCP format set to " << (use_h264 ? "H.264" : "MJPEG") << std::endl;
+    }
+
+    bool isTcpFormatH264() const {
+        return tcp_uses_h264_;
+    }
+
+    std::string getTcpFormat() const {
+        return tcp_uses_h264_ ? "H.264" : "MJPEG";
     }
 
     bool isMjpegOutputEnabled() const {
@@ -2586,66 +2855,65 @@ public:
 int main(int argc, char *argv[]) {
     std::cout << "Camera Module v3 + Pi Zero 2W + libcamera" << std::endl;
 
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <broadcast_port> [remote_ip] [remote_port] [max_clients]" << std::endl;
-        std::cerr << "Example: " << argv[0] << " 8554" << std::endl;
-        std::cerr << "         " << argv[0] << " 8554 192.168.1.100 8555 5" << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "Environment variables:" << std::endl;
-        std::cerr << "  TELEGRAM_CHAT_ID     - Telegram chat ID for photo sending" << std::endl;
-        std::cerr << "  TELEGRAM_BOT_TOKEN   - Telegram bot token" << std::endl;
-        std::cerr << "  TCP_FORMAT           - Format for TCP senders: 'h264' or 'mjpeg' (default: h264)" << std::endl;
-        return -1;
+    // Load configuration
+    std::string config_file = "config.json";
+    if (argc >= 2) {
+        config_file = argv[1];
     }
 
-    try {
-        // ========================================================================
-        // Determine TCP format from environment variable
-        // ========================================================================
-        const char* tcp_format_env = std::getenv("TCP_FORMAT");
-        std::string tcp_format = tcp_format_env ? tcp_format_env : "h264";
-        bool use_h264_for_tcp = (tcp_format == "h264");
+    Config config = Config::load(config_file);
+    config.print();
 
-        std::cout << "TCP Format: " << (use_h264_for_tcp ? "H.264" : "MJPEG") << std::endl;
+    try {
+        bool use_h264_for_tcp = (config.tcp.format == "h264");
 
         // ========================================================================
         // Setup MJPEG Sender (Telegram)
         // ========================================================================
-        const char* chat_id_env = std::getenv("TELEGRAM_CHAT_ID");
-        std::string chat_id = chat_id_env ? chat_id_env : "123456789";
+        std::shared_ptr<TelegramSender> telegram_sender;
 
-        auto telegram_sender = std::make_shared<TelegramSender>(chat_id);
-        telegram_sender->start();
+        if (config.telegram.enabled) {
+            telegram_sender = std::make_shared<TelegramSender>(
+                config.telegram.bot_token,
+                config.telegram.chat_id,
+                config.telegram.max_queue_size
+            );
+            telegram_sender->start();
+        }
 
         // ========================================================================
         // Setup TCP Senders (Broadcaster + Client)
         // ========================================================================
-        int broadcast_port = std::stoi(argv[1]);
-        int max_clients = (argc >= 5) ? std::stoi(argv[4]) : 5;
-
-        // Create TCP broadcaster
-        auto tcp_broadcaster = std::make_shared<TcpBroadcastSender>(broadcast_port, max_clients);
-        std::cout << "Added TCP Broadcaster on port " << broadcast_port
-                  << " (max clients: " << max_clients << ")" << std::endl;
-
-        // Create TCP client if remote server specified
+        std::shared_ptr<TcpBroadcastSender> tcp_broadcaster;
         std::shared_ptr<TcpSender> tcp_client;
-        if (argc >= 4) {
-            std::string remote_ip = argv[2];
-            int remote_port = std::stoi(argv[3]);
-            tcp_client = std::make_shared<TcpSender>(remote_ip, remote_port);
-            std::cout << "Added TCP Client connecting to " << remote_ip
-                      << ":" << remote_port << std::endl;
+
+        if (config.tcp.broadcast.enabled) {
+            tcp_broadcaster = std::make_shared<TcpBroadcastSender>(
+                config.tcp.broadcast.port,
+                config.tcp.broadcast.max_clients
+            );
+            std::cout << "TCP Broadcaster enabled on port " << config.tcp.broadcast.port
+                      << " (max clients: " << config.tcp.broadcast.max_clients << ")" << std::endl;
+        }
+
+        if (config.tcp.client.enabled) {
+            tcp_client = std::make_shared<TcpSender>(
+                config.tcp.client.remote_ip,
+                config.tcp.client.remote_port,
+                config.tcp.client.reconnect_interval_sec
+            );
+            std::cout << "TCP Client connecting to " << config.tcp.client.remote_ip
+                      << ":" << config.tcp.client.remote_port << std::endl;
         }
 
         // ========================================================================
         // Create handlers based on selected format
         // ========================================================================
-        MjpegFrameHandler mjpeg_handler(telegram_sender);
         H264FrameHandler h264_handler(nullptr);
+        MjpegFrameHandler mjpeg_handler(telegram_sender, nullptr);  // Default: Telegram only
 
         if (use_h264_for_tcp) {
-            // H.264 format for TCP
+            // H.264 format for TCP - Telegram gets MJPEG burst, TCP gets H.264
             auto composite_h264 = std::make_shared<CompositeH264Sender>();
 
             // Cast to IH264Sender and add to composite
@@ -2662,26 +2930,27 @@ int main(int argc, char *argv[]) {
 
             h264_handler = H264FrameHandler(composite_h264);
 
+            // MJPEG handler: Telegram only (no TCP sender)
+            mjpeg_handler = MjpegFrameHandler(telegram_sender, nullptr);
+
         } else {
-            // MJPEG format for TCP
-            auto composite_mjpeg = std::make_shared<CompositeMjpegSender>();
+            // MJPEG format for TCP - separate Telegram (burst) and TCP (streaming)
+            auto tcp_composite = std::make_shared<CompositeMjpegSender>();
 
-            // Add Telegram sender
-            composite_mjpeg->addSender(telegram_sender);
-
-            // Cast to IMjpegSender and add to composite
+            // Cast to IMjpegSender and add TCP senders to composite
             std::shared_ptr<IMjpegSender> mjpeg_broadcaster = tcp_broadcaster;
-            composite_mjpeg->addSender(mjpeg_broadcaster);
+            tcp_composite->addSender(mjpeg_broadcaster);
 
             if (tcp_client) {
                 std::shared_ptr<IMjpegSender> mjpeg_client = tcp_client;
-                composite_mjpeg->addSender(mjpeg_client);
+                tcp_composite->addSender(mjpeg_client);
             }
 
-            std::cout << "MJPEG Composite Sender configured with "
-                      << composite_mjpeg->getSenderCount() << " sender(s)" << std::endl;
+            std::cout << "MJPEG TCP Composite Sender configured with "
+                      << tcp_composite->getSenderCount() << " sender(s)" << std::endl;
 
-            mjpeg_handler = MjpegFrameHandler(composite_mjpeg);
+            // MJPEG handler: Telegram for burst, TCP composite for streaming
+            mjpeg_handler = MjpegFrameHandler(telegram_sender, tcp_composite);
 
             // Create empty H.264 handler (won't be used)
             auto empty_h264 = std::make_shared<CompositeH264Sender>();
@@ -2691,7 +2960,15 @@ int main(int argc, char *argv[]) {
         // ========================================================================
         // Create and configure capturer
         // ========================================================================
-        CapturerV2 capturer(std::move(mjpeg_handler), std::move(h264_handler), 1920, 1080);
+        CapturerV2 capturer(
+            std::move(mjpeg_handler),
+            std::move(h264_handler),
+            config.camera.width,
+            config.camera.height,
+            config.h264.gop_size,
+            config.h264.bitrate,
+            config.h264.sps_pps_repeat
+        );
 
         if (!capturer.initialize()) {
             return -1;
@@ -2705,27 +2982,63 @@ int main(int argc, char *argv[]) {
             return -1;
         }
 
-        capturer.setAutofocusMode(2);  // 0=Auto, 1=Manual, 2=Continuous
-        capturer.setAutofocusSpeed(1); // 0=Normal, 1=Fast
-        capturer.setAutofocusRange(2); // 0=Normal, 1=Macro, 2=Full
-        capturer.enableAutofocus(true);
-        capturer.setFrameRate(30);  // 30 FPS
-        capturer.enableMotionDetection(true); // Enable motion detection by default
-        capturer.setMotionFrameSkip(7); // Process every 7th frame (motion detection)
-        capturer.setMotionTailDuration(0); // Record for 0 seconds after motion stops
-        capturer.setBurstPhotoTarget(5);  // Collect 5 photos before sending as media group
+        // Set TCP format flag
+        capturer.setTcpFormat(use_h264_for_tcp);
 
+        // Configure autofocus
+        if (config.autofocus.enabled) {
+            capturer.setAutofocusMode(config.autofocus.mode);
+            capturer.setAutofocusSpeed(config.autofocus.speed);
+            capturer.setAutofocusRange(config.autofocus.range);
+            capturer.enableAutofocus(true);
+            std::cout << "Autofocus enabled (mode: " << config.autofocus.mode
+                      << ", speed: " << config.autofocus.speed
+                      << ", range: " << config.autofocus.range << ")" << std::endl;
+        } else {
+            capturer.enableAutofocus(false);
+            std::cout << "Autofocus disabled" << std::endl;
+        }
+
+        // Configure frame rate
+        capturer.setFrameRate(config.camera.fps);
+
+        // Configure motion detection
+        if (config.motion_detection.enabled) {
+            capturer.enableMotionDetection(true);
+            capturer.setMotionFrameSkip(config.motion_detection.frame_skip);
+            capturer.setMotionTailDuration(config.motion_detection.tail_duration);
+            std::cout << "Motion detection enabled (frame_skip: " << config.motion_detection.frame_skip
+                      << ", tail_duration: " << config.motion_detection.tail_duration << "s)" << std::endl;
+        } else {
+            capturer.enableMotionDetection(false);
+            std::cout << "Motion detection disabled" << std::endl;
+        }
+
+        // Configure MJPEG burst photo collection
+        capturer.setBurstPhotoTarget(config.mjpeg.burst_photo_count);
+        capturer.setJpegEncodeInterval(config.mjpeg.encode_interval_ms);
+
+        // Configure H.264 encoder
         if (capturer.isH264Available()) {
             std::cout << "H.264 hardware encoder detected!" << std::endl;
-            capturer.enableH264Encoding(true);
-            capturer.setH264GopSize(60);  // 1 I-frame every 60 frames
-            capturer.setH264Bitrate(5000000, false);  // 5Mbps VBR = false, CBR = true
+            if (config.h264.enabled) {
+                capturer.enableH264Encoding(true);
+                capturer.setH264GopSize(config.h264.gop_size);
+                capturer.setH264Bitrate(config.h264.bitrate, config.h264.cbr);
+                std::cout << "H.264 encoding enabled (GOP: " << config.h264.gop_size
+                          << ", bitrate: " << config.h264.bitrate
+                          << ", mode: " << (config.h264.cbr ? "CBR" : "VBR") << ")" << std::endl;
+            } else {
+                capturer.enableH264Encoding(false);
+                std::cout << "H.264 encoding disabled by config" << std::endl;
+            }
         } else {
             std::cout << "H.264 hardware encoder not available, using JPEG only" << std::endl;
         }
 
-        capturer.enableMjpegOutput(true);
-        capturer.enableH264Output(true);
+        // Enable/disable output formats
+        capturer.enableMjpegOutput(config.mjpeg.enabled && config.mjpeg.output_enabled);
+        capturer.enableH264Output(config.h264.enabled && config.h264.output_enabled);
 
         if (!capturer.startCapture()) {
             return -1;
