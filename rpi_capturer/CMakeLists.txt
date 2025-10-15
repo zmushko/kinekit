@@ -10,8 +10,8 @@ find_package(CURL REQUIRED)
 pkg_check_modules(LIBCAMERA REQUIRED libcamera)
 pkg_check_modules(LIBTURBOJPEG REQUIRED libturbojpeg)
 
-# Add nlohmann_json
-include_directories(${CMAKE_SOURCE_DIR}/../subprojects/nlohmann_json-3.11.2/include)
+# cpptoml is provided by system package libcpptoml-dev
+# Header is in /usr/include/cpptoml.h
 
 include_directories(${LIBCAMERA_INCLUDE_DIRS})
 include_directories(${CURL_INCLUDE_DIRS})

@@ -1,0 +1,63 @@
+# RPI Capturer Configuration
+
+[camera]
+width = 1920                    # Resolution width
+height = 1080                   # Resolution height
+fps = 30                        # Frames per second
+
+[autofocus]
+enabled = true                  # Enable autofocus (Camera Module v3 only)
+mode = 2                        # 0=Auto, 1=Manual, 2=Continuous
+speed = 1                       # 0=Normal, 1=Fast
+range = 2                       # 0=Normal, 1=Macro, 2=Full
+
+[motion_detection]
+enabled = true                  # Enable motion detection
+frame_skip = 7                  # Frames to skip between checks (reduces CPU load)
+tail_duration = 0               # Seconds to record after motion stops
+
+[mjpeg]
+enabled = true                  # Enable MJPEG encoder
+output_enabled = true           # Save/send MJPEG frames
+encode_interval_ms = 300        # Milliseconds between snapshots
+burst_photo_count = 5           # Photos to capture when motion detected
+
+[h264]
+enabled = true                  # Enable H.264 video encoder
+output_enabled = true           # Save/send H.264 video
+gop_size = 60                   # Frames between keyframes
+bitrate = 5000000               # Bits per second (5Mbps)
+cbr = false                     # Use constant bitrate (false = VBR)
+sps_pps_repeat = true           # Repeat headers for streaming compatibility
+
+[telegram]
+enabled = true                  # Enable Telegram bot
+bot_token = "YOUR_BOT_TOKEN_HERE"
+chat_id = "YOUR_CHAT_ID_HERE"
+max_queue_size = 5              # Maximum pending messages
+
+[tcp]
+format = "h264"                 # Stream format: "h264" or "mjpeg"
+
+[tcp.broadcast]
+enabled = true                  # Act as TCP server
+port = 8554                     # Listen port
+max_clients = 5                 # Maximum simultaneous connections
+
+[tcp.client]
+enabled = false                 # Connect to remote server
+remote_ip = "10.0.0.2"
+remote_port = 9999
+reconnect_interval_sec = 1      # Retry interval on disconnect
+
+[video_recording]
+enabled = true                  # Enable video recording
+duration_sec = 15               # Video file duration
+preroll_sec = 3                 # Buffer before motion detected
+max_memory_mb = 20              # Memory buffer size
+failed_videos_dir = "/home/pi/recordings/failed"
+max_failed_files = 50           # Keep last N failed uploads
+# retry_interval_sec = 2          # Retry delay for failed uploads
+# max_retries = 2                 # Upload retry attempts
+# send_to_telegram = true         # Upload videos to Telegram
+output_video_path = "./video"   # Path to save video reels

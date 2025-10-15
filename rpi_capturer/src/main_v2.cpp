@@ -26,7 +26,7 @@
 #include <queue>
 #include <condition_variable>
 #include <atomic>
-#include <nlohmann/json.hpp>
+#include <cpptoml.h>
 
 // ARM NEON intrinsics for SIMD optimization
 #ifdef __ARM_NEON
@@ -34,7 +34,6 @@
 #endif
 
 using namespace libcamera;
-using json = nlohmann::json;
 
 // V4L2 Control IDs for video encoder
 namespace V4L2Controls {
@@ -107,7 +106,7 @@ public:
 
         struct Broadcast {
             bool enabled = true;
-            int port = 8554;
+            int port = 9999;
             int max_clients = 5;
         } broadcast;
 
@@ -119,93 +118,113 @@ public:
         } client;
     } tcp;
 
-    // Load configuration from JSON file
+    // Video recording settings
+    struct VideoRecording {
+        bool enabled = true;
+        int duration_sec = 30;
+        int preroll_sec = 3;
+        int max_memory_mb = 20;
+        std::string failed_videos_dir = "/home/pi/recordings/failed";
+        int max_failed_files = 50;
+        int retry_interval_sec = 2;
+        int max_retries = 2;
+        bool send_to_telegram = true;
+    } video_recording;
+
+    // Load configuration from TOML file
     static Config load(const std::string& filename) {
         Config config;
 
         try {
-            std::ifstream file(filename);
-            if (!file.is_open()) {
-                std::cerr << "Config file '" << filename << "' not found, using defaults" << std::endl;
-                return config;
-            }
-
-            json j;
-            file >> j;
+            auto toml = cpptoml::parse_file(filename);
 
             // Camera
-            if (j.contains("camera")) {
-                auto& cam = j["camera"];
-                config.camera.width = cam.value("width", config.camera.width);
-                config.camera.height = cam.value("height", config.camera.height);
-                config.camera.fps = cam.value("fps", config.camera.fps);
+            auto camera = toml->get_table("camera");
+            if (camera) {
+                config.camera.width = camera->get_as<int>("width").value_or(config.camera.width);
+                config.camera.height = camera->get_as<int>("height").value_or(config.camera.height);
+                config.camera.fps = camera->get_as<int>("fps").value_or(config.camera.fps);
             }
 
             // Autofocus
-            if (j.contains("autofocus")) {
-                auto& af = j["autofocus"];
-                config.autofocus.enabled = af.value("enabled", config.autofocus.enabled);
-                config.autofocus.mode = af.value("mode", config.autofocus.mode);
-                config.autofocus.speed = af.value("speed", config.autofocus.speed);
-                config.autofocus.range = af.value("range", config.autofocus.range);
+            auto autofocus = toml->get_table("autofocus");
+            if (autofocus) {
+                config.autofocus.enabled = autofocus->get_as<bool>("enabled").value_or(config.autofocus.enabled);
+                config.autofocus.mode = autofocus->get_as<int>("mode").value_or(config.autofocus.mode);
+                config.autofocus.speed = autofocus->get_as<int>("speed").value_or(config.autofocus.speed);
+                config.autofocus.range = autofocus->get_as<int>("range").value_or(config.autofocus.range);
             }
 
             // Motion detection
-            if (j.contains("motion_detection")) {
-                auto& md = j["motion_detection"];
-                config.motion_detection.enabled = md.value("enabled", config.motion_detection.enabled);
-                config.motion_detection.frame_skip = md.value("frame_skip", config.motion_detection.frame_skip);
-                config.motion_detection.tail_duration = md.value("tail_duration", config.motion_detection.tail_duration);
+            auto motion = toml->get_table("motion_detection");
+            if (motion) {
+                config.motion_detection.enabled = motion->get_as<bool>("enabled").value_or(config.motion_detection.enabled);
+                config.motion_detection.frame_skip = motion->get_as<int>("frame_skip").value_or(config.motion_detection.frame_skip);
+                config.motion_detection.tail_duration = motion->get_as<int>("tail_duration").value_or(config.motion_detection.tail_duration);
             }
 
             // MJPEG
-            if (j.contains("mjpeg")) {
-                auto& mjpeg = j["mjpeg"];
-                config.mjpeg.enabled = mjpeg.value("enabled", config.mjpeg.enabled);
-                config.mjpeg.output_enabled = mjpeg.value("output_enabled", config.mjpeg.output_enabled);
-                config.mjpeg.encode_interval_ms = mjpeg.value("encode_interval_ms", config.mjpeg.encode_interval_ms);
-                config.mjpeg.burst_photo_count = mjpeg.value("burst_photo_count", config.mjpeg.burst_photo_count);
+            auto mjpeg = toml->get_table("mjpeg");
+            if (mjpeg) {
+                config.mjpeg.enabled = mjpeg->get_as<bool>("enabled").value_or(config.mjpeg.enabled);
+                config.mjpeg.output_enabled = mjpeg->get_as<bool>("output_enabled").value_or(config.mjpeg.output_enabled);
+                config.mjpeg.encode_interval_ms = mjpeg->get_as<int>("encode_interval_ms").value_or(config.mjpeg.encode_interval_ms);
+                config.mjpeg.burst_photo_count = mjpeg->get_as<int>("burst_photo_count").value_or(config.mjpeg.burst_photo_count);
             }
 
             // H.264
-            if (j.contains("h264")) {
-                auto& h264 = j["h264"];
-                config.h264.enabled = h264.value("enabled", config.h264.enabled);
-                config.h264.output_enabled = h264.value("output_enabled", config.h264.output_enabled);
-                config.h264.gop_size = h264.value("gop_size", config.h264.gop_size);
-                config.h264.bitrate = h264.value("bitrate", config.h264.bitrate);
-                config.h264.cbr = h264.value("cbr", config.h264.cbr);
-                config.h264.sps_pps_repeat = h264.value("sps_pps_repeat", config.h264.sps_pps_repeat);
+            auto h264 = toml->get_table("h264");
+            if (h264) {
+                config.h264.enabled = h264->get_as<bool>("enabled").value_or(config.h264.enabled);
+                config.h264.output_enabled = h264->get_as<bool>("output_enabled").value_or(config.h264.output_enabled);
+                config.h264.gop_size = h264->get_as<int>("gop_size").value_or(config.h264.gop_size);
+                config.h264.bitrate = h264->get_as<int>("bitrate").value_or(config.h264.bitrate);
+                config.h264.cbr = h264->get_as<bool>("cbr").value_or(config.h264.cbr);
+                config.h264.sps_pps_repeat = h264->get_as<bool>("sps_pps_repeat").value_or(config.h264.sps_pps_repeat);
             }
 
             // Telegram
-            if (j.contains("telegram")) {
-                auto& tg = j["telegram"];
-                config.telegram.enabled = tg.value("enabled", config.telegram.enabled);
-                config.telegram.bot_token = tg.value("bot_token", config.telegram.bot_token);
-                config.telegram.chat_id = tg.value("chat_id", config.telegram.chat_id);
-                config.telegram.max_queue_size = tg.value("max_queue_size", config.telegram.max_queue_size);
+            auto telegram = toml->get_table("telegram");
+            if (telegram) {
+                config.telegram.enabled = telegram->get_as<bool>("enabled").value_or(config.telegram.enabled);
+                config.telegram.bot_token = telegram->get_as<std::string>("bot_token").value_or(config.telegram.bot_token);
+                config.telegram.chat_id = telegram->get_as<std::string>("chat_id").value_or(config.telegram.chat_id);
+                config.telegram.max_queue_size = telegram->get_as<int>("max_queue_size").value_or(config.telegram.max_queue_size);
             }
 
             // TCP
-            if (j.contains("tcp")) {
-                auto& tcp = j["tcp"];
-                config.tcp.format = tcp.value("format", config.tcp.format);
+            auto tcp = toml->get_table("tcp");
+            if (tcp) {
+                config.tcp.format = tcp->get_as<std::string>("format").value_or(config.tcp.format);
 
-                if (tcp.contains("broadcast")) {
-                    auto& bc = tcp["broadcast"];
-                    config.tcp.broadcast.enabled = bc.value("enabled", config.tcp.broadcast.enabled);
-                    config.tcp.broadcast.port = bc.value("port", config.tcp.broadcast.port);
-                    config.tcp.broadcast.max_clients = bc.value("max_clients", config.tcp.broadcast.max_clients);
+                auto tcp_broadcast = tcp->get_table("broadcast");
+                if (tcp_broadcast) {
+                    config.tcp.broadcast.enabled = tcp_broadcast->get_as<bool>("enabled").value_or(config.tcp.broadcast.enabled);
+                    config.tcp.broadcast.port = tcp_broadcast->get_as<int>("port").value_or(config.tcp.broadcast.port);
+                    config.tcp.broadcast.max_clients = tcp_broadcast->get_as<int>("max_clients").value_or(config.tcp.broadcast.max_clients);
                 }
 
-                if (tcp.contains("client")) {
-                    auto& cl = tcp["client"];
-                    config.tcp.client.enabled = cl.value("enabled", config.tcp.client.enabled);
-                    config.tcp.client.remote_ip = cl.value("remote_ip", config.tcp.client.remote_ip);
-                    config.tcp.client.remote_port = cl.value("remote_port", config.tcp.client.remote_port);
-                    config.tcp.client.reconnect_interval_sec = cl.value("reconnect_interval_sec", config.tcp.client.reconnect_interval_sec);
+                auto tcp_client = tcp->get_table("client");
+                if (tcp_client) {
+                    config.tcp.client.enabled = tcp_client->get_as<bool>("enabled").value_or(config.tcp.client.enabled);
+                    config.tcp.client.remote_ip = tcp_client->get_as<std::string>("remote_ip").value_or(config.tcp.client.remote_ip);
+                    config.tcp.client.remote_port = tcp_client->get_as<int>("remote_port").value_or(config.tcp.client.remote_port);
+                    config.tcp.client.reconnect_interval_sec = tcp_client->get_as<int>("reconnect_interval_sec").value_or(config.tcp.client.reconnect_interval_sec);
                 }
+            }
+
+            // Video recording
+            auto video_recording = toml->get_table("video_recording");
+            if (video_recording) {
+                config.video_recording.enabled = video_recording->get_as<bool>("enabled").value_or(config.video_recording.enabled);
+                config.video_recording.duration_sec = video_recording->get_as<int>("duration_sec").value_or(config.video_recording.duration_sec);
+                config.video_recording.preroll_sec = video_recording->get_as<int>("preroll_sec").value_or(config.video_recording.preroll_sec);
+                config.video_recording.max_memory_mb = video_recording->get_as<int>("max_memory_mb").value_or(config.video_recording.max_memory_mb);
+                config.video_recording.failed_videos_dir = video_recording->get_as<std::string>("failed_videos_dir").value_or(config.video_recording.failed_videos_dir);
+                config.video_recording.max_failed_files = video_recording->get_as<int>("max_failed_files").value_or(config.video_recording.max_failed_files);
+                config.video_recording.retry_interval_sec = video_recording->get_as<int>("retry_interval_sec").value_or(config.video_recording.retry_interval_sec);
+                config.video_recording.max_retries = video_recording->get_as<int>("max_retries").value_or(config.video_recording.max_retries);
+                config.video_recording.send_to_telegram = video_recording->get_as<bool>("send_to_telegram").value_or(config.video_recording.send_to_telegram);
             }
 
             std::cout << "Configuration loaded from '" << filename << "'" << std::endl;
@@ -2856,7 +2875,7 @@ int main(int argc, char *argv[]) {
     std::cout << "Camera Module v3 + Pi Zero 2W + libcamera" << std::endl;
 
     // Load configuration
-    std::string config_file = "config.json";
+    std::string config_file = "config.toml";
     if (argc >= 2) {
         config_file = argv[1];
     }
