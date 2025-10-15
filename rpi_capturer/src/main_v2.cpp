@@ -18,15 +18,25 @@
 #include <cstring>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <curl/curl.h>
 #include <map>
 #include <string>
 #include <queue>
+#include <deque>
 #include <condition_variable>
 #include <atomic>
 #include <cpptoml.h>
+
+// FFmpeg libav for MP4 muxing
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/opt.h>
+#include <libavutil/imgutils.h>
+}
 
 // ARM NEON intrinsics for SIMD optimization
 #ifdef __ARM_NEON
@@ -71,7 +81,6 @@ public:
     struct MotionDetection {
         bool enabled = true;
         int frame_skip = 7;
-        int tail_duration = 0;
     } motion_detection;
 
     // MJPEG settings
@@ -123,6 +132,7 @@ public:
         bool enabled = true;
         int duration_sec = 30;
         int preroll_sec = 3;
+        int tail_duration = 5;
         int max_memory_mb = 20;
         std::string failed_videos_dir = "/home/pi/recordings/failed";
         int max_failed_files = 50;
@@ -160,7 +170,6 @@ public:
             if (motion) {
                 config.motion_detection.enabled = motion->get_as<bool>("enabled").value_or(config.motion_detection.enabled);
                 config.motion_detection.frame_skip = motion->get_as<int>("frame_skip").value_or(config.motion_detection.frame_skip);
-                config.motion_detection.tail_duration = motion->get_as<int>("tail_duration").value_or(config.motion_detection.tail_duration);
             }
 
             // MJPEG
@@ -219,6 +228,7 @@ public:
                 config.video_recording.enabled = video_recording->get_as<bool>("enabled").value_or(config.video_recording.enabled);
                 config.video_recording.duration_sec = video_recording->get_as<int>("duration_sec").value_or(config.video_recording.duration_sec);
                 config.video_recording.preroll_sec = video_recording->get_as<int>("preroll_sec").value_or(config.video_recording.preroll_sec);
+                config.video_recording.tail_duration = video_recording->get_as<int>("tail_duration").value_or(config.video_recording.tail_duration);
                 config.video_recording.max_memory_mb = video_recording->get_as<int>("max_memory_mb").value_or(config.video_recording.max_memory_mb);
                 config.video_recording.failed_videos_dir = video_recording->get_as<std::string>("failed_videos_dir").value_or(config.video_recording.failed_videos_dir);
                 config.video_recording.max_failed_files = video_recording->get_as<int>("max_failed_files").value_or(config.video_recording.max_failed_files);
@@ -938,6 +948,473 @@ public:
         out_jpeg.resize(jpeg_size_);
         std::memcpy(out_jpeg.data(), jpeg_data_, jpeg_size_);
         return true;
+    }
+};
+
+// ============================================================================
+// Circular Video Buffer - stores H.264 frames for preroll recording
+// ============================================================================
+class CircularVideoBuffer {
+private:
+    struct H264Frame {
+        std::vector<unsigned char> data;
+        bool is_keyframe;
+        std::chrono::steady_clock::time_point timestamp;
+
+        size_t size() const { return data.size(); }
+    };
+
+    std::deque<H264Frame> frames_;
+    size_t max_size_bytes_;
+    size_t current_size_bytes_;
+
+public:
+    CircularVideoBuffer(size_t max_size_mb)
+        : max_size_bytes_(max_size_mb * 1024 * 1024), current_size_bytes_(0) {
+        std::cout << "CircularVideoBuffer initialized: max " << max_size_mb << " MB" << std::endl;
+    }
+
+    // Add frame to buffer
+    void addFrame(const std::vector<unsigned char>& data, bool is_keyframe) {
+        H264Frame frame;
+        frame.data = data;
+        frame.is_keyframe = is_keyframe;
+        frame.timestamp = std::chrono::steady_clock::now();
+
+        size_t frame_size = frame.size();
+        current_size_bytes_ += frame_size;
+        frames_.push_back(std::move(frame));
+
+        // Remove oldest frames if buffer exceeds max size
+        while (current_size_bytes_ > max_size_bytes_ && !frames_.empty()) {
+            current_size_bytes_ -= frames_.front().size();
+            frames_.pop_front();
+        }
+    }
+
+    // Get all frames (for writing preroll to file)
+    std::vector<H264Frame> getAllFrames() const {
+        return std::vector<H264Frame>(frames_.begin(), frames_.end());
+    }
+
+    // Get frames from specific duration (e.g., last N seconds)
+    std::vector<H264Frame> getFrames(int duration_sec) const {
+        std::vector<H264Frame> result;
+        auto now = std::chrono::steady_clock::now();
+        auto cutoff = now - std::chrono::seconds(duration_sec);
+
+        for (const auto& frame : frames_) {
+            if (frame.timestamp >= cutoff) {
+                result.push_back(frame);
+            }
+        }
+        return result;
+    }
+
+    void clear() {
+        frames_.clear();
+        current_size_bytes_ = 0;
+    }
+
+    size_t getFrameCount() const { return frames_.size(); }
+    size_t getCurrentSizeMB() const { return current_size_bytes_ / (1024 * 1024); }
+    size_t getCurrentSizeBytes() const { return current_size_bytes_; }
+};
+
+// ============================================================================
+// Helper function to create directory recursively (like mkdir -p)
+// ============================================================================
+static bool createDirectoryRecursive(const std::string& path) {
+    if (path.empty()) return false;
+
+    // Check if already exists
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+
+    // Find parent directory
+    size_t pos = path.find_last_of('/');
+    if (pos != std::string::npos && pos > 0) {
+        std::string parent = path.substr(0, pos);
+        if (!createDirectoryRecursive(parent)) {
+            return false;
+        }
+    }
+
+    // Create this directory
+    if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
+        std::cerr << "Failed to create directory: " << path << " (" << strerror(errno) << ")" << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// MP4 Video File Writer - writes H.264 frames to MP4 container using libav
+// ============================================================================
+class VideoFileWriter {
+private:
+    AVFormatContext* fmt_ctx_;
+    AVStream* video_stream_;
+    std::string filename_;
+    size_t bytes_written_;
+    std::chrono::steady_clock::time_point start_time_;
+    int64_t video_pts_;
+    bool is_open_;
+    bool header_written_;
+    int width_;
+    int height_;
+    int fps_;
+
+public:
+    VideoFileWriter()
+        : fmt_ctx_(nullptr), video_stream_(nullptr),
+          bytes_written_(0), video_pts_(0), is_open_(false), header_written_(false),
+          width_(1920), height_(1080), fps_(30) {}
+
+    ~VideoFileWriter() {
+        close();
+    }
+
+    void setResolution(int width, int height, int fps) {
+        width_ = width;
+        height_ = height;
+        fps_ = fps;
+    }
+
+    // Create new MP4 video file with timestamp
+    bool open(const std::string& directory = "/home/pi/recordings") {
+        if (is_open_) {
+            std::cerr << "VideoFileWriter: file already open" << std::endl;
+            return false;
+        }
+
+        // Create directory if it doesn't exist
+        if (!createDirectoryRecursive(directory)) {
+            std::cerr << "VideoFileWriter: failed to create directory: " << directory << std::endl;
+            return false;
+        }
+
+        // Generate filename with timestamp
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm = *std::localtime(&time_t);
+
+        std::ostringstream oss;
+        oss << directory << "/motion_"
+            << std::put_time(&tm, "%Y-%m-%d_%H-%M-%S")
+            << ".mp4";
+        filename_ = oss.str();
+
+        // Allocate output format context
+        avformat_alloc_output_context2(&fmt_ctx_, nullptr, "mp4", filename_.c_str());
+        if (!fmt_ctx_) {
+            std::cerr << "VideoFileWriter: cannot allocate output context" << std::endl;
+            return false;
+        }
+
+        // Create video stream (no codec - just container for H.264 stream)
+        video_stream_ = avformat_new_stream(fmt_ctx_, nullptr);
+        if (!video_stream_) {
+            std::cerr << "VideoFileWriter: cannot create video stream" << std::endl;
+            avformat_free_context(fmt_ctx_);
+            fmt_ctx_ = nullptr;
+            return false;
+        }
+
+        // Set stream parameters for H.264
+        video_stream_->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+        video_stream_->codecpar->codec_id = AV_CODEC_ID_H264;
+        video_stream_->codecpar->width = width_;
+        video_stream_->codecpar->height = height_;
+        video_stream_->time_base = { 1, 1000000 };  // microseconds
+        video_stream_->avg_frame_rate = { fps_, 1 };
+
+        // Open output file
+        int ret = avio_open(&fmt_ctx_->pb, filename_.c_str(), AVIO_FLAG_WRITE);
+        if (ret < 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            std::cerr << "VideoFileWriter: cannot open file: " << errbuf << std::endl;
+            avformat_free_context(fmt_ctx_);
+            fmt_ctx_ = nullptr;
+            return false;
+        }
+
+        bytes_written_ = 0;
+        video_pts_ = 0;
+        start_time_ = std::chrono::steady_clock::now();
+        is_open_ = true;
+        header_written_ = false;
+
+        std::cout << "VideoFileWriter: opened MP4 " << filename_ << std::endl;
+        return true;
+    }
+
+    // Write H.264 frame to MP4
+    bool writeFrame(const std::vector<unsigned char>& data) {
+        if (!is_open_ || !fmt_ctx_) {
+            std::cerr << "VideoFileWriter: file not open" << std::endl;
+            return false;
+        }
+
+        // If header not written, write it now (will work if encoder sends extradata)
+        if (!header_written_) {
+            int ret = avformat_write_header(fmt_ctx_, nullptr);
+            if (ret < 0) {
+                char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                std::cerr << "VideoFileWriter: cannot write header: " << errbuf << std::endl;
+                return false;
+            }
+            header_written_ = true;
+            std::cout << "VideoFileWriter: MP4 header written" << std::endl;
+        }
+
+        // Create packet
+        AVPacket* pkt = av_packet_alloc();
+        if (!pkt) {
+            std::cerr << "VideoFileWriter: cannot allocate packet" << std::endl;
+            return false;
+        }
+
+        // Copy H.264 data to packet
+        pkt->data = const_cast<unsigned char*>(data.data());
+        pkt->size = data.size();
+        pkt->stream_index = video_stream_->index;
+        pkt->pts = video_pts_;
+        pkt->dts = video_pts_;
+
+        // Increment PTS
+        video_pts_ += (1000000 / fps_);
+
+        // Detect keyframes (NAL unit type 5 for H.264 IDR)
+        if (data.size() > 4) {
+            uint8_t nal_type = (data[4] & 0x1F);
+            if (nal_type == 5) {  // IDR
+                pkt->flags |= AV_PKT_FLAG_KEY;
+            }
+        }
+
+        // Write packet to MP4
+        int ret = av_interleaved_write_frame(fmt_ctx_, pkt);
+
+        // Don't free packet data (we don't own it), but free packet structure
+        pkt->data = nullptr;
+        pkt->size = 0;
+        av_packet_free(&pkt);
+
+        if (ret < 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            std::cerr << "VideoFileWriter: write failed: " << errbuf << std::endl;
+            return false;
+        }
+
+        bytes_written_ += data.size();
+        return true;
+    }
+
+    // Close MP4 file
+    void close() {
+        if (is_open_ && fmt_ctx_) {
+            // Only write trailer if header was written
+            if (header_written_) {
+                av_write_trailer(fmt_ctx_);
+            } else {
+                std::cout << "VideoFileWriter: closing without trailer (header was never written)" << std::endl;
+            }
+
+            // Close file
+            if (fmt_ctx_->pb) {
+                avio_closep(&fmt_ctx_->pb);
+            }
+
+            // Free format context
+            avformat_free_context(fmt_ctx_);
+            fmt_ctx_ = nullptr;
+            video_stream_ = nullptr;
+            is_open_ = false;
+            header_written_ = false;
+
+            auto duration = std::chrono::steady_clock::now() - start_time_;
+            auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
+            float mb_written = bytes_written_ / (1024.0f * 1024.0f);
+
+            std::cout << "VideoFileWriter: closed MP4 " << filename_
+                      << " (" << mb_written << " MB, " << seconds << " sec)" << std::endl;
+        }
+    }
+
+    bool isOpen() const { return is_open_; }
+    std::string getFilename() const { return filename_; }
+    size_t getBytesWritten() const { return bytes_written_; }
+};
+
+// ============================================================================
+// Video Recording Manager - manages recording state and file writing
+// ============================================================================
+class VideoRecordingManager {
+private:
+    enum class State {
+        IDLE,           // No motion, accumulating preroll
+        RECORDING,      // Motion detected, recording to file
+        TAIL            // Motion ended, recording tail duration
+    };
+
+    State state_;
+    CircularVideoBuffer preroll_buffer_;
+    VideoFileWriter file_writer_;
+
+    // Configuration
+    int preroll_sec_;
+    int duration_sec_;
+    int tail_duration_sec_;
+    std::string output_dir_;
+    int width_;
+    int height_;
+    int fps_;
+
+    // Timing
+    std::chrono::steady_clock::time_point recording_start_time_;
+    std::chrono::steady_clock::time_point last_motion_time_;
+    std::chrono::steady_clock::time_point tail_start_time_;
+
+public:
+    VideoRecordingManager(const Config::VideoRecording& config, int width = 1920, int height = 1080, int fps = 30)
+        : state_(State::IDLE),
+          preroll_buffer_(config.max_memory_mb),
+          preroll_sec_(config.preroll_sec),
+          duration_sec_(config.duration_sec),
+          tail_duration_sec_(config.tail_duration),
+          output_dir_("/home/pi/recordings"),
+          width_(width),
+          height_(height),
+          fps_(fps) {
+
+        // Set resolution for file writer
+        file_writer_.setResolution(width_, height_, fps_);
+
+        std::cout << "VideoRecordingManager initialized: "
+                  << width_ << "x" << height_ << "@" << fps_ << "fps, "
+                  << "preroll=" << preroll_sec_ << "s, "
+                  << "duration=" << duration_sec_ << "s, "
+                  << "tail=" << tail_duration_sec_ << "s" << std::endl;
+    }
+
+    ~VideoRecordingManager() {
+        if (file_writer_.isOpen()) {
+            file_writer_.close();
+        }
+    }
+
+    // Process H.264 frame
+    void processFrame(const std::vector<unsigned char>& data, bool is_keyframe, bool motion_detected) {
+        auto now = std::chrono::steady_clock::now();
+
+        switch (state_) {
+            case State::IDLE: {
+                // Always add to preroll buffer
+                preroll_buffer_.addFrame(data, is_keyframe);
+
+                if (motion_detected) {
+                    // Start recording
+                    startRecording();
+                }
+                break;
+            }
+
+            case State::RECORDING: {
+                // Write frame to file
+                file_writer_.writeFrame(data);
+
+                if (motion_detected) {
+                    // Update last motion time
+                    last_motion_time_ = now;
+                }
+
+                // Check if we should stop recording
+                auto recording_duration = std::chrono::duration_cast<std::chrono::seconds>(now - recording_start_time_);
+                if (recording_duration.count() >= duration_sec_) {
+                    stopRecording();
+                    break;
+                }
+
+                // If no recent motion, enter tail state
+                if (!motion_detected) {
+                    auto time_since_motion = std::chrono::duration_cast<std::chrono::seconds>(now - last_motion_time_);
+                    if (time_since_motion.count() > 0) {
+                        enterTailState();
+                    }
+                }
+                break;
+            }
+
+            case State::TAIL: {
+                // Write frame to file
+                file_writer_.writeFrame(data);
+
+                if (motion_detected) {
+                    // Motion detected again, back to recording
+                    state_ = State::RECORDING;
+                    last_motion_time_ = now;
+                    std::cout << "VideoRecordingManager: motion resumed, back to RECORDING" << std::endl;
+                    break;
+                }
+
+                // Check if tail duration exceeded
+                auto tail_duration = std::chrono::duration_cast<std::chrono::seconds>(now - tail_start_time_);
+                if (tail_duration.count() >= tail_duration_sec_) {
+                    stopRecording();
+                }
+                break;
+            }
+        }
+    }
+
+    bool isRecording() const {
+        return state_ == State::RECORDING || state_ == State::TAIL;
+    }
+
+    std::string getCurrentFilename() const {
+        return file_writer_.getFilename();
+    }
+
+private:
+    void startRecording() {
+        std::cout << "VideoRecordingManager: starting recording" << std::endl;
+
+        // Open new file
+        if (!file_writer_.open(output_dir_)) {
+            std::cerr << "Failed to start recording" << std::endl;
+            return;
+        }
+
+        // Write preroll frames
+        auto preroll_frames = preroll_buffer_.getFrames(preroll_sec_);
+        std::cout << "Writing " << preroll_frames.size() << " preroll frames" << std::endl;
+        for (const auto& frame : preroll_frames) {
+            file_writer_.writeFrame(frame.data);
+        }
+
+        // Update state
+        state_ = State::RECORDING;
+        recording_start_time_ = std::chrono::steady_clock::now();
+        last_motion_time_ = recording_start_time_;
+    }
+
+    void enterTailState() {
+        std::cout << "VideoRecordingManager: entering TAIL state" << std::endl;
+        state_ = State::TAIL;
+        tail_start_time_ = std::chrono::steady_clock::now();
+    }
+
+    void stopRecording() {
+        std::cout << "VideoRecordingManager: stopping recording" << std::endl;
+        file_writer_.close();
+        state_ = State::IDLE;
     }
 };
 
@@ -2282,6 +2759,9 @@ private:
     // Motion detection
     std::unique_ptr<MotionDetector> motion_detector_;
 
+    // Video recording
+    std::unique_ptr<VideoRecordingManager> video_recorder_;
+
     // Motion tail recording (continue for 5 seconds after motion stops)
     std::chrono::steady_clock::time_point last_motion_time_;
     std::chrono::seconds motion_tail_duration_{5}; // Continue recording for 5 seconds after motion stops
@@ -2325,7 +2805,8 @@ private:
 public:
     CapturerV2(MjpegFrameHandler mjpeg_handler, H264FrameHandler h264_handler,
                int width = 1920, int height = 1080,
-               int h264_gop_size = 60, int h264_bitrate = 5000000, bool h264_sps_pps_repeat = true)
+               int h264_gop_size = 60, int h264_bitrate = 5000000, bool h264_sps_pps_repeat = true,
+               const Config::VideoRecording* video_rec_config = nullptr)
         : cm_(std::make_unique<CameraManager>()),
           mjpeg_handler_(std::move(mjpeg_handler)),
           h264_handler_(std::move(h264_handler)),
@@ -2340,6 +2821,11 @@ public:
 
         // Initialize motion detector
         motion_detector_ = std::make_unique<MotionDetector>(width_, height_, 4); // Downsample factor 4
+
+        // Initialize video recorder if enabled
+        if (video_rec_config && video_rec_config->enabled) {
+            video_recorder_ = std::make_unique<VideoRecordingManager>(*video_rec_config, width, height, current_fps_);
+        }
     }
     
     bool initialize() {
@@ -2561,6 +3047,11 @@ public:
 
             if (h264_encoder_->encodeDMA(first_plane.fd.get(), h264_data, is_keyframe)) {
                 h264_handler_(h264_data, is_keyframe);
+
+                // Record video to file if video_recorder is enabled
+                if (video_recorder_) {
+                    video_recorder_->processFrame(h264_data, is_keyframe, motion);
+                }
             } else {
                 std::cout << "H.264 DMA encoding failed" << std::endl;
             }
@@ -2986,7 +3477,8 @@ int main(int argc, char *argv[]) {
             config.camera.height,
             config.h264.gop_size,
             config.h264.bitrate,
-            config.h264.sps_pps_repeat
+            config.h264.sps_pps_repeat,
+            &config.video_recording
         );
 
         if (!capturer.initialize()) {
@@ -3025,9 +3517,7 @@ int main(int argc, char *argv[]) {
         if (config.motion_detection.enabled) {
             capturer.enableMotionDetection(true);
             capturer.setMotionFrameSkip(config.motion_detection.frame_skip);
-            capturer.setMotionTailDuration(config.motion_detection.tail_duration);
-            std::cout << "Motion detection enabled (frame_skip: " << config.motion_detection.frame_skip
-                      << ", tail_duration: " << config.motion_detection.tail_duration << "s)" << std::endl;
+            std::cout << "Motion detection enabled (frame_skip: " << config.motion_detection.frame_skip << ")" << std::endl;
         } else {
             capturer.enableMotionDetection(false);
             std::cout << "Motion detection disabled" << std::endl;

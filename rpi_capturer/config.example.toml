@@ -14,7 +14,6 @@ range = 2                       # 0=Normal, 1=Macro, 2=Full
 [motion_detection]
 enabled = true                  # Enable motion detection
 frame_skip = 7                  # Frames to skip between checks (reduces CPU load)
-tail_duration = 0               # Seconds to record after motion stops
 
 [mjpeg]
 enabled = true                  # Enable MJPEG encoder
@@ -52,12 +51,12 @@ reconnect_interval_sec = 1      # Retry interval on disconnect
 
 [video_recording]
 enabled = true                  # Enable video recording
-duration_sec = 15               # Video file duration
+duration_sec = 30               # Video file duration
 preroll_sec = 3                 # Buffer before motion detected
+tail_duration = 5               # Seconds to record after motion stops
 max_memory_mb = 20              # Memory buffer size
 failed_videos_dir = "/home/pi/recordings/failed"
 max_failed_files = 50           # Keep last N failed uploads
 # retry_interval_sec = 2          # Retry delay for failed uploads
 # max_retries = 2                 # Upload retry attempts
 # send_to_telegram = true         # Upload videos to Telegram
-output_video_path = "./video"   # Path to save video reels
