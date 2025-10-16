@@ -1395,6 +1395,295 @@ public:
 };
 
 // ============================================================================
+// VideoUploader - Async video file uploader to Telegram
+// ============================================================================
+class VideoUploader {
+private:
+    struct UploadTask {
+        std::string filename;
+        int attempt_count;
+        std::chrono::steady_clock::time_point next_retry_time;
+
+        UploadTask(const std::string& fname = "")
+            : filename(fname), attempt_count(0),
+              next_retry_time(std::chrono::steady_clock::now()) {}
+    };
+
+    std::unique_ptr<TelegramBotApi> bot_api_;
+    std::string chat_id_;
+
+    // Configuration
+    bool enabled_;
+    int max_retries_;
+    int retry_interval_sec_;
+    std::string failed_videos_dir_;
+    int max_failed_files_;
+
+    // Async queue
+    std::queue<UploadTask> upload_queue_;
+    std::vector<UploadTask> retry_queue_;  // Failed uploads waiting for retry
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::thread worker_thread_;
+    std::atomic<bool> running_{false};
+
+    int uploaded_counter_ = 0;
+
+    // Read file into memory
+    bool readFile(const std::string& filename, std::vector<unsigned char>& data) {
+        std::ifstream file(filename, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            std::cerr << "VideoUploader: Cannot open file: " << filename << std::endl;
+            return false;
+        }
+
+        std::streamsize size = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        data.resize(size);
+        if (!file.read(reinterpret_cast<char*>(data.data()), size)) {
+            std::cerr << "VideoUploader: Failed to read file: " << filename << std::endl;
+            return false;
+        }
+
+        std::cout << "VideoUploader: Loaded file " << filename
+                  << " (" << (size / (1024.0 * 1024.0)) << " MB)" << std::endl;
+        return true;
+    }
+
+    // Move file to failed directory
+    bool moveToFailed(const std::string& filename) {
+        // Create failed directory if it doesn't exist
+        std::string cmd = "mkdir -p \"" + failed_videos_dir_ + "\"";
+        int ret = system(cmd.c_str());
+        if (ret != 0) {
+            std::cerr << "VideoUploader: Failed to create directory: "
+                      << failed_videos_dir_ << std::endl;
+        }
+
+        // Extract filename from path
+        size_t last_slash = filename.find_last_of("/\\");
+        std::string base_filename = (last_slash == std::string::npos)
+            ? filename : filename.substr(last_slash + 1);
+
+        std::string dest_path = failed_videos_dir_ + "/" + base_filename;
+
+        // Move file
+        if (std::rename(filename.c_str(), dest_path.c_str()) == 0) {
+            std::cout << "VideoUploader: Moved failed upload to " << dest_path << std::endl;
+
+            // Clean up old failed files if exceeding max_failed_files_
+            cleanupFailedFiles();
+            return true;
+        } else {
+            std::cerr << "VideoUploader: Failed to move file to " << dest_path << std::endl;
+            return false;
+        }
+    }
+
+    // Clean up old failed files
+    void cleanupFailedFiles() {
+        // Count files in failed directory
+        std::string cmd = "find \"" + failed_videos_dir_ + "\" -type f -name '*.mp4' | wc -l";
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) return;
+
+        int file_count = 0;
+        fscanf(pipe, "%d", &file_count);
+        pclose(pipe);
+
+        if (file_count > max_failed_files_) {
+            // Delete oldest files
+            int to_delete = file_count - max_failed_files_;
+            std::string delete_cmd = "cd \"" + failed_videos_dir_ + "\" && "
+                "ls -t *.mp4 | tail -n " + std::to_string(to_delete) + " | xargs rm -f";
+            system(delete_cmd.c_str());
+            std::cout << "VideoUploader: Cleaned up " << to_delete << " old failed files" << std::endl;
+        }
+    }
+
+    // Calculate video duration from file
+    int getVideoDuration(const std::string& filename) {
+        // Simple estimation: parse filename for recording duration
+        // Format: motion_YYYY-MM-DD_HH-MM-SS.mp4
+        // For now, return 0 to let Telegram auto-detect
+        return 0;
+    }
+
+    // Worker thread loop
+    void workerLoop() {
+        while (running_) {
+            UploadTask task;
+            bool has_task = false;
+
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+
+                // Wait for new task or retry time
+                queue_cv_.wait_for(lock, std::chrono::seconds(1), [this] {
+                    return !upload_queue_.empty() || !running_;
+                });
+
+                if (!running_ && upload_queue_.empty() && retry_queue_.empty()) {
+                    break;
+                }
+
+                // Check retry queue first
+                auto now = std::chrono::steady_clock::now();
+                for (auto it = retry_queue_.begin(); it != retry_queue_.end(); ) {
+                    if (now >= it->next_retry_time) {
+                        task = *it;
+                        has_task = true;
+                        it = retry_queue_.erase(it);
+                        break;
+                    } else {
+                        ++it;
+                    }
+                }
+
+                // If no retry, check upload queue
+                if (!has_task && !upload_queue_.empty()) {
+                    task = upload_queue_.front();
+                    upload_queue_.pop();
+                    has_task = true;
+                }
+            }
+
+            if (has_task) {
+                processUpload(task);
+            }
+        }
+
+        std::cout << "VideoUploader worker thread stopped" << std::endl;
+    }
+
+    // Process single upload task
+    void processUpload(UploadTask& task) {
+        task.attempt_count++;
+
+        std::cout << "VideoUploader: Processing " << task.filename
+                  << " (attempt " << task.attempt_count << "/" << max_retries_ << ")" << std::endl;
+
+        // Read file
+        std::vector<unsigned char> video_data;
+        if (!readFile(task.filename, video_data)) {
+            std::cerr << "VideoUploader: Failed to read file, moving to failed" << std::endl;
+            moveToFailed(task.filename);
+            return;
+        }
+
+        // Get video duration
+        int duration = getVideoDuration(task.filename);
+
+        // Extract filename for caption
+        size_t last_slash = task.filename.find_last_of("/\\");
+        std::string base_filename = (last_slash == std::string::npos)
+            ? task.filename : task.filename.substr(last_slash + 1);
+
+        std::string caption = "Motion detected: " + base_filename;
+
+        // Send to Telegram
+        bool success = bot_api_->sendVideo(chat_id_, video_data, duration, caption);
+
+        if (success) {
+            std::cout << "VideoUploader: Successfully uploaded " << task.filename << std::endl;
+            uploaded_counter_++;
+
+            // Delete file after successful upload
+            if (std::remove(task.filename.c_str()) == 0) {
+                std::cout << "VideoUploader: Deleted " << task.filename << std::endl;
+            } else {
+                std::cerr << "VideoUploader: Failed to delete " << task.filename << std::endl;
+            }
+        } else {
+            std::cerr << "VideoUploader: Failed to upload " << task.filename << std::endl;
+
+            // Retry or move to failed
+            if (task.attempt_count < max_retries_) {
+                // Schedule retry
+                task.next_retry_time = std::chrono::steady_clock::now()
+                    + std::chrono::seconds(retry_interval_sec_);
+
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                retry_queue_.push_back(task);
+
+                std::cout << "VideoUploader: Scheduled retry for " << task.filename
+                          << " in " << retry_interval_sec_ << " seconds" << std::endl;
+            } else {
+                std::cerr << "VideoUploader: Max retries reached, moving to failed" << std::endl;
+                moveToFailed(task.filename);
+            }
+        }
+    }
+
+public:
+    VideoUploader(
+        const std::string& bot_token,
+        const std::string& chat_id,
+        bool enabled = true,
+        int max_retries = 2,
+        int retry_interval_sec = 2,
+        const std::string& failed_videos_dir = "/home/pi/recordings/failed",
+        int max_failed_files = 50
+    ) : chat_id_(chat_id),
+        enabled_(enabled),
+        max_retries_(max_retries),
+        retry_interval_sec_(retry_interval_sec),
+        failed_videos_dir_(failed_videos_dir),
+        max_failed_files_(max_failed_files) {
+
+        if (enabled_) {
+            bot_api_ = std::make_unique<TelegramBotApi>(bot_token);
+            std::cout << "VideoUploader initialized (chat_id: " << chat_id_
+                      << ", max_retries: " << max_retries_
+                      << ", retry_interval: " << retry_interval_sec_ << "s)" << std::endl;
+        } else {
+            std::cout << "VideoUploader disabled" << std::endl;
+        }
+    }
+
+    ~VideoUploader() {
+        stop();
+    }
+
+    void start() {
+        if (enabled_ && !running_) {
+            running_ = true;
+            worker_thread_ = std::thread(&VideoUploader::workerLoop, this);
+            std::cout << "VideoUploader worker thread started" << std::endl;
+        }
+    }
+
+    void stop() {
+        if (running_) {
+            running_ = false;
+            queue_cv_.notify_all();
+            if (worker_thread_.joinable()) {
+                worker_thread_.join();
+            }
+            std::cout << "VideoUploader stopped (uploaded " << uploaded_counter_ << " videos)" << std::endl;
+        }
+    }
+
+    // Add video file to upload queue
+    void enqueueVideo(const std::string& filename) {
+        if (!enabled_) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        upload_queue_.emplace(filename);
+        queue_cv_.notify_one();
+
+        std::cout << "VideoUploader: Enqueued " << filename
+                  << " (queue size: " << upload_queue_.size() << ")" << std::endl;
+    }
+
+    bool isEnabled() const { return enabled_; }
+    int getUploadedCount() const { return uploaded_counter_; }
+};
+
+// ============================================================================
 // Video Recording Manager - manages recording state and file writing
 // ============================================================================
 class VideoRecordingManager {
@@ -1408,6 +1697,9 @@ private:
     State state_;
     CircularVideoBuffer preroll_buffer_;
     VideoFileWriter file_writer_;
+
+    // Video uploader (optional)
+    VideoUploader* video_uploader_;
 
     // Configuration
     int preroll_sec_;
@@ -1424,16 +1716,22 @@ private:
     std::chrono::steady_clock::time_point tail_start_time_;
 
 public:
-    VideoRecordingManager(const Config::VideoRecording& config, int width = 1920, int height = 1080, int fps = 30)
-        : state_(State::IDLE),
-          preroll_buffer_(config.max_memory_mb),
-          preroll_sec_(config.preroll_sec),
-          duration_sec_(config.duration_sec),
-          tail_duration_sec_(config.tail_duration),
-          output_dir_("/home/pi/recordings"),
-          width_(width),
-          height_(height),
-          fps_(fps) {
+    VideoRecordingManager(
+        const Config::VideoRecording& config,
+        int width = 1920,
+        int height = 1080,
+        int fps = 30,
+        VideoUploader* video_uploader = nullptr
+    ) : state_(State::IDLE),
+        preroll_buffer_(config.max_memory_mb),
+        video_uploader_(video_uploader),
+        preroll_sec_(config.preroll_sec),
+        duration_sec_(config.duration_sec),
+        tail_duration_sec_(config.tail_duration),
+        output_dir_("/home/pi/recordings"),
+        width_(width),
+        height_(height),
+        fps_(fps) {
 
         // Set resolution for file writer
         file_writer_.setResolution(width_, height_, fps_);
@@ -1442,7 +1740,9 @@ public:
                   << width_ << "x" << height_ << "@" << fps_ << "fps, "
                   << "preroll=" << preroll_sec_ << "s, "
                   << "duration=" << duration_sec_ << "s, "
-                  << "tail=" << tail_duration_sec_ << "s" << std::endl;
+                  << "tail=" << tail_duration_sec_ << "s"
+                  << (video_uploader_ ? " (Telegram upload enabled)" : "")
+                  << std::endl;
     }
 
     ~VideoRecordingManager() {
@@ -1554,7 +1854,18 @@ private:
 
     void stopRecording() {
         std::cout << "VideoRecordingManager: stopping recording" << std::endl;
+
+        // Get filename before closing
+        std::string filename = file_writer_.getFilename();
+
+        // Close file
         file_writer_.close();
+
+        // Enqueue for upload if video uploader is available
+        if (video_uploader_ && !filename.empty()) {
+            video_uploader_->enqueueVideo(filename);
+        }
+
         state_ = State::IDLE;
     }
 };
@@ -2947,7 +3258,8 @@ public:
     CapturerV2(MjpegFrameHandler mjpeg_handler, H264FrameHandler h264_handler,
                int width = 1920, int height = 1080,
                int h264_gop_size = 60, int h264_bitrate = 5000000, bool h264_sps_pps_repeat = true,
-               const Config::VideoRecording* video_rec_config = nullptr)
+               const Config::VideoRecording* video_rec_config = nullptr,
+               VideoUploader* video_uploader = nullptr)
         : cm_(std::make_unique<CameraManager>()),
           mjpeg_handler_(std::move(mjpeg_handler)),
           h264_handler_(std::move(h264_handler)),
@@ -2965,7 +3277,7 @@ public:
 
         // Initialize video recorder if enabled
         if (video_rec_config && video_rec_config->enabled) {
-            video_recorder_ = std::make_unique<VideoRecordingManager>(*video_rec_config, width, height, current_fps_);
+            video_recorder_ = std::make_unique<VideoRecordingManager>(*video_rec_config, width, height, current_fps_, video_uploader);
         }
     }
     
@@ -3533,6 +3845,25 @@ int main(int argc, char *argv[]) {
         }
 
         // ========================================================================
+        // Setup Video Uploader (Telegram)
+        // ========================================================================
+        std::shared_ptr<VideoUploader> video_uploader;
+
+        if (config.telegram.enabled && config.video_recording.enabled && config.video_recording.send_to_telegram) {
+            video_uploader = std::make_shared<VideoUploader>(
+                config.telegram.bot_token,
+                config.telegram.chat_id,
+                true,  // enabled
+                config.video_recording.max_retries,
+                config.video_recording.retry_interval_sec,
+                config.video_recording.failed_videos_dir,
+                config.video_recording.max_failed_files
+            );
+            video_uploader->start();
+            std::cout << "VideoUploader enabled for Telegram" << std::endl;
+        }
+
+        // ========================================================================
         // Setup TCP Senders (Broadcaster + Client)
         // ========================================================================
         std::shared_ptr<TcpBroadcastSender> tcp_broadcaster;
@@ -3619,7 +3950,8 @@ int main(int argc, char *argv[]) {
             config.h264.gop_size,
             config.h264.bitrate,
             config.h264.sps_pps_repeat,
-            &config.video_recording
+            &config.video_recording,
+            video_uploader.get()
         );
 
         if (!capturer.initialize()) {
