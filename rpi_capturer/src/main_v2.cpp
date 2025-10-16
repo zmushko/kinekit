@@ -1160,48 +1160,189 @@ public:
             return false;
         }
 
-        // If header not written, write it now (will work if encoder sends extradata)
+        // If header not written yet, we need to extract SPS/PPS first
         if (!header_written_) {
-            int ret = avformat_write_header(fmt_ctx_, nullptr);
-            if (ret < 0) {
-                char errbuf[AV_ERROR_MAX_STRING_SIZE];
-                av_strerror(ret, errbuf, sizeof(errbuf));
-                std::cerr << "VideoFileWriter: cannot write header: " << errbuf << std::endl;
-                return false;
+            // Find all NAL units in this frame
+            std::vector<uint8_t> sps_data, pps_data, idr_data;
+            bool has_sps = false, has_pps = false, has_idr = false;
+
+            size_t i = 0;
+            while (i + 4 < data.size()) {
+                // Look for start code: 0x00 0x00 0x00 0x01
+                if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {
+                    size_t nal_start = i;
+                    uint8_t nal_type = data[i+4] & 0x1F;
+
+                    // Find next start code to determine NAL unit size
+                    size_t next_start = i + 4;
+                    while (next_start + 4 < data.size()) {
+                        if (data[next_start] == 0 && data[next_start+1] == 0 &&
+                            data[next_start+2] == 0 && data[next_start+3] == 1) {
+                            break;
+                        }
+                        next_start++;
+                    }
+                    if (next_start + 4 >= data.size()) {
+                        next_start = data.size();
+                    }
+
+                    // Extract this NAL unit
+                    if (nal_type == 7) {  // SPS
+                        sps_data.assign(data.begin() + nal_start, data.begin() + next_start);
+                        has_sps = true;
+                    } else if (nal_type == 8) {  // PPS
+                        pps_data.assign(data.begin() + nal_start, data.begin() + next_start);
+                        has_pps = true;
+                    } else if (nal_type == 5) {  // IDR
+                        idr_data.assign(data.begin() + nal_start, data.begin() + next_start);
+                        has_idr = true;
+                    }
+
+                    i = next_start;
+                } else {
+                    i++;
+                }
             }
-            header_written_ = true;
-            std::cout << "VideoFileWriter: MP4 header written" << std::endl;
+
+            // We need SPS+PPS+IDR to write header
+            if (has_sps && has_pps && has_idr) {
+                std::cout << "VideoFileWriter: Found SPS (" << sps_data.size()
+                          << " bytes), PPS (" << pps_data.size()
+                          << " bytes), IDR (" << idr_data.size() << " bytes)" << std::endl;
+
+                // Combine SPS and PPS for extradata
+                std::vector<uint8_t> extradata;
+                extradata.insert(extradata.end(), sps_data.begin(), sps_data.end());
+                extradata.insert(extradata.end(), pps_data.begin(), pps_data.end());
+
+                // Set extradata in stream codecpar
+                video_stream_->codecpar->extradata_size = extradata.size();
+                video_stream_->codecpar->extradata = (uint8_t*)av_malloc(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE);
+                if (!video_stream_->codecpar->extradata) {
+                    std::cerr << "VideoFileWriter: cannot allocate extradata" << std::endl;
+                    return false;
+                }
+                memcpy(video_stream_->codecpar->extradata, extradata.data(), extradata.size());
+                memset(video_stream_->codecpar->extradata + extradata.size(), 0, AV_INPUT_BUFFER_PADDING_SIZE);
+
+                // NOW write MP4 header with SPS/PPS in extradata
+                int ret = avformat_write_header(fmt_ctx_, nullptr);
+                if (ret < 0) {
+                    char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                    av_strerror(ret, errbuf, sizeof(errbuf));
+                    std::cerr << "VideoFileWriter: cannot write header: " << errbuf << std::endl;
+                    return false;
+                }
+                header_written_ = true;
+                std::cout << "VideoFileWriter: MP4 header written with extradata ("
+                          << extradata.size() << " bytes)" << std::endl;
+
+                // Now write ONLY the IDR frame (without SPS/PPS, as they're in extradata now)
+                AVPacket* pkt = av_packet_alloc();
+                if (!pkt) {
+                    std::cerr << "VideoFileWriter: cannot allocate packet" << std::endl;
+                    return false;
+                }
+
+                pkt->data = idr_data.data();
+                pkt->size = idr_data.size();
+                pkt->stream_index = video_stream_->index;
+                pkt->pts = video_pts_;
+                pkt->dts = video_pts_;
+                pkt->flags = AV_PKT_FLAG_KEY;
+
+                video_pts_ += (1000000 / fps_);
+
+                ret = av_interleaved_write_frame(fmt_ctx_, pkt);
+
+                pkt->data = nullptr;
+                pkt->size = 0;
+                av_packet_free(&pkt);
+
+                if (ret < 0) {
+                    char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                    av_strerror(ret, errbuf, sizeof(errbuf));
+                    std::cerr << "VideoFileWriter: write failed: " << errbuf << std::endl;
+                    return false;
+                }
+
+                bytes_written_ += idr_data.size();
+                return true;
+            } else {
+                // Skip frames until we get SPS+PPS+IDR
+                std::cout << "VideoFileWriter: Waiting for SPS+PPS+IDR (got: "
+                          << (has_sps ? "SPS " : "")
+                          << (has_pps ? "PPS " : "")
+                          << (has_idr ? "IDR " : "") << ")" << std::endl;
+                return true;
+            }
         }
 
-        // Create packet
+        // Header already written - now we need to strip SPS/PPS from subsequent frames
+        // and write only the actual video data
+        std::vector<uint8_t> frame_without_headers;
+        size_t i = 0;
+        while (i + 4 < data.size()) {
+            if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {
+                size_t nal_start = i;
+                uint8_t nal_type = data[i+4] & 0x1F;
+
+                // Find next start code
+                size_t next_start = i + 4;
+                while (next_start + 4 < data.size()) {
+                    if (data[next_start] == 0 && data[next_start+1] == 0 &&
+                        data[next_start+2] == 0 && data[next_start+3] == 1) {
+                        break;
+                    }
+                    next_start++;
+                }
+                if (next_start + 4 >= data.size()) {
+                    next_start = data.size();
+                }
+
+                // Skip SPS (7) and PPS (8), keep everything else (IDR=5, non-IDR=1)
+                if (nal_type != 7 && nal_type != 8) {
+                    frame_without_headers.insert(frame_without_headers.end(),
+                                                data.begin() + nal_start,
+                                                data.begin() + next_start);
+                }
+
+                i = next_start;
+            } else {
+                i++;
+            }
+        }
+
+        // If frame is empty after stripping headers, skip it
+        if (frame_without_headers.empty()) {
+            return true;
+        }
+
+        // Create packet with stripped data
         AVPacket* pkt = av_packet_alloc();
         if (!pkt) {
             std::cerr << "VideoFileWriter: cannot allocate packet" << std::endl;
             return false;
         }
 
-        // Copy H.264 data to packet
-        pkt->data = const_cast<unsigned char*>(data.data());
-        pkt->size = data.size();
+        pkt->data = frame_without_headers.data();
+        pkt->size = frame_without_headers.size();
         pkt->stream_index = video_stream_->index;
         pkt->pts = video_pts_;
         pkt->dts = video_pts_;
 
-        // Increment PTS
-        video_pts_ += (1000000 / fps_);
-
         // Detect keyframes (NAL unit type 5 for H.264 IDR)
-        if (data.size() > 4) {
-            uint8_t nal_type = (data[4] & 0x1F);
-            if (nal_type == 5) {  // IDR
+        if (frame_without_headers.size() > 4) {
+            uint8_t nal_type = (frame_without_headers[4] & 0x1F);
+            if (nal_type == 5) {
                 pkt->flags |= AV_PKT_FLAG_KEY;
             }
         }
 
-        // Write packet to MP4
+        video_pts_ += (1000000 / fps_);
+
         int ret = av_interleaved_write_frame(fmt_ctx_, pkt);
 
-        // Don't free packet data (we don't own it), but free packet structure
         pkt->data = nullptr;
         pkt->size = 0;
         av_packet_free(&pkt);
@@ -1213,7 +1354,7 @@ public:
             return false;
         }
 
-        bytes_written_ += data.size();
+        bytes_written_ += frame_without_headers.size();
         return true;
     }
 
