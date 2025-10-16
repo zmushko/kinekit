@@ -1061,9 +1061,11 @@ private:
     std::string filename_;
     size_t bytes_written_;
     std::chrono::steady_clock::time_point start_time_;
+    std::chrono::steady_clock::time_point first_frame_time_;
     int64_t video_pts_;
     bool is_open_;
     bool header_written_;
+    bool first_frame_written_;
     int width_;
     int height_;
     int fps_;
@@ -1072,7 +1074,7 @@ public:
     VideoFileWriter()
         : fmt_ctx_(nullptr), video_stream_(nullptr),
           bytes_written_(0), video_pts_(0), is_open_(false), header_written_(false),
-          width_(1920), height_(1080), fps_(30) {}
+          first_frame_written_(false), width_(1920), height_(1080), fps_(30) {}
 
     ~VideoFileWriter() {
         close();
@@ -1148,17 +1150,28 @@ public:
         start_time_ = std::chrono::steady_clock::now();
         is_open_ = true;
         header_written_ = false;
+        first_frame_written_ = false;
 
         std::cout << "VideoFileWriter: opened MP4 " << filename_ << std::endl;
         return true;
     }
 
-    // Write H.264 frame to MP4
-    bool writeFrame(const std::vector<unsigned char>& data) {
+    // Write H.264 frame to MP4 with real timestamp
+    bool writeFrame(const std::vector<unsigned char>& data, std::chrono::steady_clock::time_point frame_time = std::chrono::steady_clock::now()) {
         if (!is_open_ || !fmt_ctx_) {
             std::cerr << "VideoFileWriter: file not open" << std::endl;
             return false;
         }
+
+        // Record first frame timestamp as reference
+        if (!first_frame_written_) {
+            first_frame_time_ = frame_time;
+            first_frame_written_ = true;
+        }
+
+        // Calculate PTS based on real time delta from first frame
+        auto delta = std::chrono::duration_cast<std::chrono::microseconds>(frame_time - first_frame_time_);
+        video_pts_ = delta.count();
 
         // If header not written yet, we need to extract SPS/PPS first
         if (!header_written_) {
@@ -1251,8 +1264,6 @@ public:
                 pkt->dts = video_pts_;
                 pkt->flags = AV_PKT_FLAG_KEY;
 
-                video_pts_ += (1000000 / fps_);
-
                 ret = av_interleaved_write_frame(fmt_ctx_, pkt);
 
                 pkt->data = nullptr;
@@ -1338,8 +1349,6 @@ public:
                 pkt->flags |= AV_PKT_FLAG_KEY;
             }
         }
-
-        video_pts_ += (1000000 / fps_);
 
         int ret = av_interleaved_write_frame(fmt_ctx_, pkt);
 
@@ -1751,8 +1760,8 @@ public:
         }
     }
 
-    // Process H.264 frame
-    void processFrame(const std::vector<unsigned char>& data, bool is_keyframe, bool motion_detected) {
+    // Process H.264 frame with timestamp
+    void processFrame(const std::vector<unsigned char>& data, bool is_keyframe, bool motion_detected, std::chrono::steady_clock::time_point frame_time = std::chrono::steady_clock::now()) {
         auto now = std::chrono::steady_clock::now();
 
         switch (state_) {
@@ -1768,8 +1777,8 @@ public:
             }
 
             case State::RECORDING: {
-                // Write frame to file
-                file_writer_.writeFrame(data);
+                // Write frame to file with real timestamp
+                file_writer_.writeFrame(data, frame_time);
 
                 if (motion_detected) {
                     // Update last motion time
@@ -1794,8 +1803,8 @@ public:
             }
 
             case State::TAIL: {
-                // Write frame to file
-                file_writer_.writeFrame(data);
+                // Write frame to file with real timestamp
+                file_writer_.writeFrame(data, frame_time);
 
                 if (motion_detected) {
                     // Motion detected again, back to recording
@@ -1833,11 +1842,11 @@ private:
             return;
         }
 
-        // Write preroll frames
+        // Write preroll frames with their original timestamps
         auto preroll_frames = preroll_buffer_.getFrames(preroll_sec_);
         std::cout << "Writing " << preroll_frames.size() << " preroll frames" << std::endl;
         for (const auto& frame : preroll_frames) {
-            file_writer_.writeFrame(frame.data);
+            file_writer_.writeFrame(frame.data, frame.timestamp);
         }
 
         // Update state
@@ -3499,11 +3508,14 @@ public:
             bool is_keyframe = false;
 
             if (h264_encoder_->encodeDMA(first_plane.fd.get(), h264_data, is_keyframe)) {
+                // Capture timestamp immediately after encoding
+                auto frame_timestamp = std::chrono::steady_clock::now();
+
                 h264_handler_(h264_data, is_keyframe);
 
-                // Record video to file if video_recorder is enabled
+                // Record video to file if video_recorder is enabled with real timestamp
                 if (video_recorder_) {
-                    video_recorder_->processFrame(h264_data, is_keyframe, motion);
+                    video_recorder_->processFrame(h264_data, is_keyframe, motion, frame_timestamp);
                 }
             } else {
                 std::cout << "H.264 DMA encoding failed" << std::endl;
