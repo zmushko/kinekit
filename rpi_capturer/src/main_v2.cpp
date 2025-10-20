@@ -41,6 +41,8 @@ extern "C" {
 // ARM NEON intrinsics for SIMD optimization
 #ifdef __ARM_NEON
 #include <arm_neon.h>
+#include <filesystem>
+#include <algorithm>
 #endif
 
 using namespace libcamera;
@@ -1281,10 +1283,10 @@ public:
                 return true;
             } else {
                 // Skip frames until we get SPS+PPS+IDR
-                std::cout << "VideoFileWriter: Waiting for SPS+PPS+IDR (got: "
-                          << (has_sps ? "SPS " : "")
-                          << (has_pps ? "PPS " : "")
-                          << (has_idr ? "IDR " : "") << ")" << std::endl;
+                // std::cout << "VideoFileWriter: Waiting for SPS+PPS+IDR (got: "
+                //           << (has_sps ? "SPS " : "")
+                //           << (has_pps ? "PPS " : "")
+                //           << (has_idr ? "IDR " : "") << ")" << std::endl;
                 return true;
             }
         }
@@ -1436,8 +1438,6 @@ private:
     std::thread worker_thread_;
     std::atomic<bool> running_{false};
 
-    int uploaded_counter_ = 0;
-
     // Read file into memory
     bool readFile(const std::string& filename, std::vector<unsigned char>& data) {
         std::ifstream file(filename, std::ios::binary | std::ios::ate);
@@ -1460,54 +1460,81 @@ private:
         return true;
     }
 
-    // Move file to failed directory
+    // Move file to failed directory (copy from tmpfs to SD, then delete)
     bool moveToFailed(const std::string& filename) {
-        // Create failed directory if it doesn't exist
-        std::string cmd = "mkdir -p \"" + failed_videos_dir_ + "\"";
-        int ret = system(cmd.c_str());
-        if (ret != 0) {
-            std::cerr << "VideoUploader: Failed to create directory: "
-                      << failed_videos_dir_ << std::endl;
-        }
+        namespace fs = std::filesystem;
 
-        // Extract filename from path
-        size_t last_slash = filename.find_last_of("/\\");
-        std::string base_filename = (last_slash == std::string::npos)
-            ? filename : filename.substr(last_slash + 1);
+        try {
+            // Create failed directory if it doesn't exist
+            if (!fs::exists(failed_videos_dir_)) {
+                fs::create_directories(failed_videos_dir_);
+            }
 
-        std::string dest_path = failed_videos_dir_ + "/" + base_filename;
+            // Extract filename from path
+            fs::path src_path(filename);
+            std::string base_filename = src_path.filename().string();
+            fs::path dest_path = fs::path(failed_videos_dir_) / base_filename;
 
-        // Move file
-        if (std::rename(filename.c_str(), dest_path.c_str()) == 0) {
-            std::cout << "VideoUploader: Moved failed upload to " << dest_path << std::endl;
+            // Copy file from tmpfs to SD (copy instead of rename for cross-filesystem support)
+            fs::copy_file(src_path, dest_path, fs::copy_options::overwrite_existing);
+
+            // Delete original file from tmpfs
+            fs::remove(src_path);
+
+            std::cout << "VideoUploader: Moved failed upload to " << dest_path.string() << std::endl;
 
             // Clean up old failed files if exceeding max_failed_files_
             cleanupFailedFiles();
             return true;
-        } else {
-            std::cerr << "VideoUploader: Failed to move file to " << dest_path << std::endl;
+
+        } catch (const fs::filesystem_error& e) {
+            std::cerr << "VideoUploader: Failed to move file to failed directory: "
+                      << e.what() << std::endl;
             return false;
         }
     }
 
     // Clean up old failed files
     void cleanupFailedFiles() {
-        // Count files in failed directory
-        std::string cmd = "find \"" + failed_videos_dir_ + "\" -type f -name '*.mp4' | wc -l";
-        FILE* pipe = popen(cmd.c_str(), "r");
-        if (!pipe) return;
+        namespace fs = std::filesystem;
 
-        int file_count = 0;
-        fscanf(pipe, "%d", &file_count);
-        pclose(pipe);
+        try {
+            // Check if directory exists
+            if (!fs::exists(failed_videos_dir_) || !fs::is_directory(failed_videos_dir_)) {
+                return;
+            }
 
-        if (file_count > max_failed_files_) {
-            // Delete oldest files
-            int to_delete = file_count - max_failed_files_;
-            std::string delete_cmd = "cd \"" + failed_videos_dir_ + "\" && "
-                "ls -t *.mp4 | tail -n " + std::to_string(to_delete) + " | xargs rm -f";
-            system(delete_cmd.c_str());
-            std::cout << "VideoUploader: Cleaned up " << to_delete << " old failed files" << std::endl;
+            // Collect all .mp4 files with their modification times
+            std::vector<std::pair<fs::path, fs::file_time_type>> files;
+            for (const auto& entry : fs::directory_iterator(failed_videos_dir_)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".mp4") {
+                    files.push_back({entry.path(), fs::last_write_time(entry)});
+                }
+            }
+
+            int file_count = files.size();
+            if (file_count > max_failed_files_) {
+                // Sort by modification time (newest first)
+                std::sort(files.begin(), files.end(),
+                    [](const auto& a, const auto& b) {
+                        return a.second > b.second;
+                    });
+
+                // Delete oldest files
+                int to_delete = file_count - max_failed_files_;
+                int deleted = 0;
+                for (size_t i = max_failed_files_; i < files.size(); ++i) {
+                    if (fs::remove(files[i].first)) {
+                        deleted++;
+                    }
+                }
+
+                if (deleted > 0) {
+                    std::cout << "VideoUploader: Cleaned up " << deleted << " old failed files" << std::endl;
+                }
+            }
+        } catch (const fs::filesystem_error& e) {
+            std::cerr << "VideoUploader: Failed to cleanup files: " << e.what() << std::endl;
         }
     }
 
@@ -1596,10 +1623,9 @@ private:
 
         if (success) {
             std::cout << "VideoUploader: Successfully uploaded " << task.filename << std::endl;
-            uploaded_counter_++;
 
             // Delete file after successful upload
-            if (std::remove(task.filename.c_str()) == 0) {
+            if (std::filesystem::remove(task.filename)) {
                 std::cout << "VideoUploader: Deleted " << task.filename << std::endl;
             } else {
                 std::cerr << "VideoUploader: Failed to delete " << task.filename << std::endl;
@@ -1670,7 +1696,7 @@ public:
             if (worker_thread_.joinable()) {
                 worker_thread_.join();
             }
-            std::cout << "VideoUploader stopped (uploaded " << uploaded_counter_ << " videos)" << std::endl;
+            std::cout << "VideoUploader stopped" << std::endl;
         }
     }
 
@@ -1689,7 +1715,6 @@ public:
     }
 
     bool isEnabled() const { return enabled_; }
-    int getUploadedCount() const { return uploaded_counter_; }
 };
 
 // ============================================================================
@@ -1737,7 +1762,7 @@ public:
         preroll_sec_(config.preroll_sec),
         duration_sec_(config.duration_sec),
         tail_duration_sec_(config.tail_duration),
-        output_dir_("/home/pi/recordings"),
+        output_dir_("/tmp/recordings"),  // Use tmpfs (RAM) to preserve SD card
         width_(width),
         height_(height),
         fps_(fps) {
@@ -2484,6 +2509,8 @@ public:
     }
 
     // Send data to all connected clients
+    // LOCK ORDER: keyframe_mutex_ must be acquired and released BEFORE clients_mutex_
+    // to prevent potential deadlock with acceptClients()
     void send(const std::vector<unsigned char>& data, bool is_keyframe = false) {
         // Cache keyframe for new clients (contains SPS/PPS + IDR if inline_headers enabled)
         if (is_keyframe) {
@@ -2587,6 +2614,7 @@ private:
             inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
 
             // Check if we've reached max clients
+            // LOCK ORDER: clients_mutex_ first, then keyframe_mutex_ (same order as in send())
             {
                 std::lock_guard<std::mutex> lock(clients_mutex_);
 
@@ -2827,7 +2855,6 @@ private:
     std::atomic<bool> running_{false};
 
     size_t max_queue_size_;  // Drop oldest messages if queue grows beyond this
-    int message_counter_ = 0;
 
     // Worker thread loop - processes messages from queue
     void workerLoop() {
@@ -2857,7 +2884,7 @@ private:
                     // Send single photo
                     success = bot_api_->sendPhoto(chat_id_, photos[0]);
                     if (success) {
-                        std::cout << "Telegram: Photo " << message_counter_++ << " sent successfully" << std::endl;
+                        std::cout << "Telegram: Photo sent successfully" << std::endl;
                     } else {
                         std::cerr << "Telegram: Failed to send photo" << std::endl;
                     }
@@ -2867,7 +2894,6 @@ private:
                     if (success) {
                         std::cout << "Telegram: Media group (" << photos.size()
                                  << " photos) sent successfully" << std::endl;
-                        message_counter_++;
                     } else {
                         std::cerr << "Telegram: Failed to send media group" << std::endl;
                     }
