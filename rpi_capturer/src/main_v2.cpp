@@ -91,6 +91,7 @@ public:
         bool output_enabled = true;
         int encode_interval_ms = 300;
         int burst_photo_count = 5;
+        int max_burst_packets_during_recording = 3;  // Max burst packets to send while recording video
     } mjpeg;
 
     // H.264 settings
@@ -181,6 +182,7 @@ public:
                 config.mjpeg.output_enabled = mjpeg->get_as<bool>("output_enabled").value_or(config.mjpeg.output_enabled);
                 config.mjpeg.encode_interval_ms = mjpeg->get_as<int>("encode_interval_ms").value_or(config.mjpeg.encode_interval_ms);
                 config.mjpeg.burst_photo_count = mjpeg->get_as<int>("burst_photo_count").value_or(config.mjpeg.burst_photo_count);
+                config.mjpeg.max_burst_packets_during_recording = mjpeg->get_as<int>("max_burst_packets_during_recording").value_or(config.mjpeg.max_burst_packets_during_recording);
             }
 
             // H.264
@@ -3273,6 +3275,8 @@ private:
     std::vector<std::vector<unsigned char>> burst_photo_buffer_;
     int burst_photo_target_ = 5;  // Collect 5 photos before sending
     int burst_counter_ = 0;           // Burst photo counter
+    int burst_packets_sent_during_recording_ = 0;  // Number of burst packets sent while recording
+    int max_burst_packets_during_recording_ = 3;   // Max allowed burst packets during recording
 
     // Camera resolution settings
     int width_ = 1920;
@@ -3551,19 +3555,53 @@ public:
         // JPEG encoding and output if enabled
         // Collect photos when motion is detected at should_detect intervals
         std::vector<unsigned char> jpeg_data = {};
-        if ((motion && should_detect && use_mjpeg_) || 
-                (burst_counter_ < burst_photo_target_ && burst_counter_ > 0 && use_mjpeg_)) {
+
+        // Check if we're recording video
+        bool is_recording = video_recorder_ && video_recorder_->isRecording();
+
+        // Reset burst packet counter when recording ends
+        static bool was_recording = false;
+        if (was_recording && !is_recording) {
+            burst_packets_sent_during_recording_ = 0;
+            std::cout << "Recording ended, reset burst packet counter" << std::endl;
+        }
+        was_recording = is_recording;
+
+        // Check if enough time has passed since last JPEG encode
+        auto now = std::chrono::steady_clock::now();
+        auto time_since_last_encode = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_jpeg_encode_time_);
+        bool can_encode = time_since_last_encode >= jpeg_encode_interval_;
+
+        // Check if we can send burst packets (not recording or under limit)
+        bool can_send_burst = !is_recording || (burst_packets_sent_during_recording_ < max_burst_packets_during_recording_);
+
+        if (((motion && should_detect && use_mjpeg_ && can_encode && can_send_burst) ||
+                (burst_counter_ < burst_photo_target_ && burst_counter_ > 0 && use_mjpeg_))) {
             burst_counter_ = (burst_counter_ + 1) % burst_photo_target_;
             if (jpeg_encoder_->encode(static_cast<unsigned char*>(mapped_data), total_yuv_size, jpeg_data)) {
+                last_jpeg_encode_time_ = now;  // Update last encode time
+
                 // Add to burst buffer
                 burst_photo_buffer_.push_back(jpeg_data);
-                std::cout << "Burst buffer: " << burst_photo_buffer_.size() << "/" << burst_photo_target_ << std::endl;
+                std::cout << "Burst buffer: " << burst_photo_buffer_.size() << "/" << burst_photo_target_;
+                if (is_recording) {
+                    std::cout << " (recording, packets sent: " << burst_packets_sent_during_recording_
+                              << "/" << max_burst_packets_during_recording_ << ")";
+                }
+                std::cout << std::endl;
 
                 // Send when buffer is full
                 if (burst_photo_buffer_.size() >= static_cast<size_t>(burst_photo_target_)) {
                     std::cout << "Sending burst of " << burst_photo_buffer_.size() << " photos to Telegram" << std::endl;
                     mjpeg_handler_.sendBurstToTelegram(burst_photo_buffer_);
                     burst_photo_buffer_.clear();
+
+                    // Increment counter if recording
+                    if (is_recording) {
+                        burst_packets_sent_during_recording_++;
+                        std::cout << "Burst packets sent during recording: " << burst_packets_sent_during_recording_
+                                  << "/" << max_burst_packets_during_recording_ << std::endl;
+                    }
                 }
             }
         }
@@ -3748,6 +3786,15 @@ public:
 
     int getBurstPhotoTarget() const {
         return burst_photo_target_;
+    }
+
+    void setMaxBurstPacketsDuringRecording(int max_packets) {
+        max_burst_packets_during_recording_ = max_packets;
+        std::cout << "Max burst packets during recording set to " << max_packets << std::endl;
+    }
+
+    int getMaxBurstPacketsDuringRecording() const {
+        return max_burst_packets_during_recording_;
     }
 
     bool setH264GopSize(int gop_size) {
@@ -4037,6 +4084,7 @@ int main(int argc, char *argv[]) {
         // Configure MJPEG burst photo collection
         capturer.setBurstPhotoTarget(config.mjpeg.burst_photo_count);
         capturer.setJpegEncodeInterval(config.mjpeg.encode_interval_ms);
+        capturer.setMaxBurstPacketsDuringRecording(config.mjpeg.max_burst_packets_during_recording);
 
         // Configure H.264 encoder
         if (capturer.isH264Available()) {

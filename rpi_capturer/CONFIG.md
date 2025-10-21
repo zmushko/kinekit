@@ -84,22 +84,31 @@ nano config.json
 
 ```json
 "mjpeg": {
-  "enabled": true,              // Enable MJPEG encoding
-  "output_enabled": true,       // Enable MJPEG output
-  "encode_interval_ms": 300,    // Minimum time between encodes (milliseconds)
-  "burst_photo_count": 5        // Photos to collect before sending
+  "enabled": true,                         // Enable MJPEG encoding
+  "output_enabled": true,                  // Enable MJPEG output
+  "encode_interval_ms": 300,               // Minimum time between adding photos to burst buffer (milliseconds)
+  "burst_photo_count": 5,                  // Photos to collect before sending
+  "max_burst_packets_during_recording": 3  // Max burst packets to send while recording video
 }
 ```
 
 **encode_interval_ms:**
 - Throttle JPEG encoding to reduce CPU usage
-- `300` = encode at most every 300ms (~3 fps)
-- Lower = more photos, higher CPU usage
+- Controls minimum time between adding photos to the burst buffer
+- `300` = add photo to burst at most every 300ms
+- Lower = more frequent photos, higher CPU usage
 
 **burst_photo_count:**
 - Number of photos to collect before sending to Telegram as media group
 - `5` = collect 5 photos, then send as album
 - `1` = send each photo individually (not recommended)
+
+**max_burst_packets_during_recording:**
+- Limits number of burst packets sent while video is being recorded
+- Prevents flooding Telegram with both photos and videos
+- `3` = send maximum 3 burst packets during video recording
+- `0` = disable burst photos completely during video recording
+- Counter resets when video recording ends
 
 ---
 

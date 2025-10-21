@@ -18,8 +18,9 @@ frame_skip = 7                  # Frames to skip between checks (reduces CPU loa
 [mjpeg]
 enabled = true                  # Enable MJPEG encoder
 output_enabled = true           # Save/send MJPEG frames
-encode_interval_ms = 300        # Milliseconds between snapshots
-burst_photo_count = 5           # Photos to capture when motion detected
+encode_interval_ms = 1000       # Milliseconds between adding photos to burst buffer
+burst_photo_count = 1           # Number of photos collect in batch before sending
+max_burst_packets_during_recording = 3  # Max burst packets to send while recording video
 
 [h264]
 enabled = true                  # Enable H.264 video encoder
