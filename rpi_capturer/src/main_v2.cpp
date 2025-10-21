@@ -28,6 +28,7 @@
 #include <deque>
 #include <condition_variable>
 #include <atomic>
+#include <functional>
 #include <cpptoml.h>
 
 // FFmpeg libav for MP4 muxing
@@ -419,6 +420,81 @@ public:
 
         return response;
     }
+
+    // Simple GET request
+    Response get(const std::string& url, int timeout_ms = 35000) {
+        Response response;
+        CURL* curl = curl_easy_init();
+
+        if (!curl) {
+            std::cerr << "Failed to initialize CURL" << std::endl;
+            return response;
+        }
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+        CURLcode res = curl_easy_perform(curl);
+
+        if (res == CURLE_OK) {
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status_code);
+            response.success = (response.status_code >= 200 && response.status_code < 300);
+        } else {
+            std::cerr << "CURL error: " << curl_easy_strerror(res) << std::endl;
+            response.success = false;
+        }
+
+        curl_easy_cleanup(curl);
+        return response;
+    }
+
+    // POST application/x-www-form-urlencoded
+    Response postForm(const std::string& url, const std::map<std::string, std::string>& fields, int timeout_ms = 10000) {
+        Response response;
+        CURL* curl = curl_easy_init();
+
+        if (!curl) {
+            std::cerr << "Failed to initialize CURL" << std::endl;
+            return response;
+        }
+
+        // Build form data
+        std::string post_data;
+        for (const auto& [key, value] : fields) {
+            if (!post_data.empty()) post_data += "&";
+
+            char* escaped_key = curl_easy_escape(curl, key.c_str(), key.length());
+            char* escaped_value = curl_easy_escape(curl, value.c_str(), value.length());
+
+            post_data += std::string(escaped_key) + "=" + std::string(escaped_value);
+
+            curl_free(escaped_key);
+            curl_free(escaped_value);
+        }
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+        CURLcode res = curl_easy_perform(curl);
+
+        if (res == CURLE_OK) {
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status_code);
+            response.success = (response.status_code >= 200 && response.status_code < 300);
+        } else {
+            std::cerr << "CURL error: " << curl_easy_strerror(res) << std::endl;
+            response.success = false;
+        }
+
+        curl_easy_cleanup(curl);
+        return response;
+    }
 };
 
 // Telegram Bot API client
@@ -586,6 +662,167 @@ public:
         std::cerr << "Telegram API: sendMediaGroup failed after "
                  << max_retries_ << " attempts" << std::endl;
         return false;
+    }
+
+    // Send text message
+    bool sendMessage(const std::string& chat_id, const std::string& text) {
+        std::string url = base_url_ + "sendMessage";
+
+        std::map<std::string, std::string> fields;
+        fields["chat_id"] = chat_id;
+        fields["text"] = text;
+
+        auto response = http_client_.postForm(url, fields);
+
+        if (response.success) {
+            std::cout << "Telegram: sent message to " << chat_id << std::endl;
+            return true;
+        }
+
+        std::cerr << "Telegram: failed to send message, HTTP " << response.status_code << std::endl;
+        return false;
+    }
+
+    // Get updates (for receiving commands)
+    std::string getUpdates(int offset = 0, int timeout = 30) {
+        std::string url = base_url_ + "getUpdates?offset=" + std::to_string(offset)
+                         + "&timeout=" + std::to_string(timeout);
+
+        auto response = http_client_.get(url);
+
+        if (response.success) {
+            return response.body;
+        }
+
+        return "";
+    }
+};
+
+// Telegram Command Handler
+class TelegramCommandHandler {
+private:
+    TelegramBotApi* bot_api_;
+    std::string chat_id_;
+    int last_update_id_ = 0;
+    std::atomic<bool> running_{false};
+    std::thread polling_thread_;
+
+    // Callback function for handling commands
+    std::function<void(const std::string&)> command_callback_;
+
+    // Simple JSON parser for getting command text from update
+    std::string extractCommand(const std::string& json_response) {
+        // Look for "text":"..." pattern
+        size_t text_pos = json_response.find("\"text\":\"");
+        if (text_pos == std::string::npos) {
+            return "";
+        }
+
+        size_t start = text_pos + 8; // Length of "text":"
+        size_t end = json_response.find("\"", start);
+
+        if (end == std::string::npos) {
+            return "";
+        }
+
+        return json_response.substr(start, end - start);
+    }
+
+    // Extract update_id from JSON
+    int extractUpdateId(const std::string& json_response) {
+        // Look for last "update_id": pattern
+        size_t pos = json_response.rfind("\"update_id\":");
+        if (pos == std::string::npos) {
+            return last_update_id_;
+        }
+
+        size_t start = pos + 12; // Length of "update_id":
+        size_t end = json_response.find_first_of(",}", start);
+
+        if (end == std::string::npos) {
+            return last_update_id_;
+        }
+
+        try {
+            return std::stoi(json_response.substr(start, end - start));
+        } catch (...) {
+            return last_update_id_;
+        }
+    }
+
+    // Polling loop
+    void pollingLoop() {
+        std::cout << "Telegram command polling started" << std::endl;
+
+        while (running_) {
+            try {
+                // Get updates with long polling (30 sec timeout)
+                std::string response = bot_api_->getUpdates(last_update_id_ + 1, 30);
+
+                if (response.empty()) {
+                    continue;
+                }
+
+                // Extract command
+                std::string command = extractCommand(response);
+                if (!command.empty() && command[0] == '/') {
+                    std::cout << "Received command: " << command << std::endl;
+
+                    // Call callback
+                    if (command_callback_) {
+                        command_callback_(command);
+                    }
+                }
+
+                // Update last_update_id
+                int new_update_id = extractUpdateId(response);
+                if (new_update_id > last_update_id_) {
+                    last_update_id_ = new_update_id;
+                }
+
+            } catch (const std::exception& e) {
+                std::cerr << "Error in polling loop: " << e.what() << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        }
+
+        std::cout << "Telegram command polling stopped" << std::endl;
+    }
+
+public:
+    TelegramCommandHandler(TelegramBotApi* bot_api, const std::string& chat_id)
+        : bot_api_(bot_api), chat_id_(chat_id) {}
+
+    ~TelegramCommandHandler() {
+        stop();
+    }
+
+    void setCommandCallback(std::function<void(const std::string&)> callback) {
+        command_callback_ = callback;
+    }
+
+    void start() {
+        if (running_) {
+            return;
+        }
+
+        running_ = true;
+        polling_thread_ = std::thread(&TelegramCommandHandler::pollingLoop, this);
+    }
+
+    void stop() {
+        if (!running_) {
+            return;
+        }
+
+        running_ = false;
+        if (polling_thread_.joinable()) {
+            polling_thread_.join();
+        }
+    }
+
+    void sendResponse(const std::string& text) {
+        bot_api_->sendMessage(chat_id_, text);
     }
 };
 
@@ -1751,6 +1988,9 @@ private:
     std::chrono::steady_clock::time_point last_motion_time_;
     std::chrono::steady_clock::time_point tail_start_time_;
 
+    // Enable/disable flag
+    bool enabled_ = true;
+
 public:
     VideoRecordingManager(
         const Config::VideoRecording& config,
@@ -1789,6 +2029,11 @@ public:
 
     // Process H.264 frame with timestamp
     void processFrame(const std::vector<unsigned char>& data, bool is_keyframe, bool motion_detected, std::chrono::steady_clock::time_point frame_time = std::chrono::steady_clock::now()) {
+        // If disabled, don't process frames
+        if (!enabled_) {
+            return;
+        }
+
         auto now = std::chrono::steady_clock::now();
 
         switch (state_) {
@@ -1857,6 +2102,19 @@ public:
 
     std::string getCurrentFilename() const {
         return file_writer_.getFilename();
+    }
+
+    void setEnabled(bool enabled) {
+        enabled_ = enabled;
+        if (!enabled && isRecording()) {
+            // Stop current recording if disabled
+            stopRecording();
+        }
+        std::cout << "VideoRecordingManager: " << (enabled ? "enabled" : "disabled") << std::endl;
+    }
+
+    bool isEnabled() const {
+        return enabled_;
     }
 
 private:
@@ -3797,6 +4055,24 @@ public:
         return max_burst_packets_during_recording_;
     }
 
+    // Enable/disable video recording
+    void enableVideoRecording(bool enable) {
+        if (!video_recorder_) {
+            std::cerr << "Video recording manager not initialized" << std::endl;
+            return;
+        }
+
+        video_recorder_->setEnabled(enable);
+    }
+
+    bool isVideoRecordingEnabled() const {
+        return video_recorder_ != nullptr;
+    }
+
+    bool isVideoRecordingActive() const {
+        return video_recorder_ && video_recorder_->isRecording();
+    }
+
     bool setH264GopSize(int gop_size) {
         if (!h264_encoder_) {
             std::cerr << "Set gop: H.264 encoder not available" << std::endl;
@@ -4112,11 +4388,52 @@ int main(int argc, char *argv[]) {
             return -1;
         }
 
+        // ========================================================================
+        // Setup Telegram Command Handler
+        // ========================================================================
+        std::shared_ptr<TelegramBotApi> bot_api;
+        std::unique_ptr<TelegramCommandHandler> command_handler;
+
+        if (config.telegram.enabled) {
+            // Create TelegramBotApi instance
+            bot_api = std::make_shared<TelegramBotApi>(config.telegram.bot_token);
+
+            // Create command handler
+            command_handler = std::make_unique<TelegramCommandHandler>(bot_api.get(), config.telegram.chat_id);
+
+            // Set command callback
+            command_handler->setCommandCallback([&capturer, &command_handler](const std::string& command) {
+                if (command == "/motion_on") {
+                    capturer.enableMotionDetection(true);
+                    command_handler->sendResponse("✅ Motion detection enabled");
+                } else if (command == "/motion_off") {
+                    capturer.enableMotionDetection(false);
+                    command_handler->sendResponse("🛑 Motion detection disabled");
+                } else if (command == "/status") {
+                    std::string status = "📊 Camera Status:\n";
+                    status += "Motion detection: " + std::string(capturer.isMotionDetectionEnabled() ? "ON" : "OFF") + "\n";
+                    // status += "Video recording: " + std::string(capturer.isVideoRecordingActive() ? "YES" : "NO");
+                    command_handler->sendResponse(status);
+                } else {
+                    command_handler->sendResponse("❓ Unknown command. Available: /motion_on, /motion_off, /status");
+                }
+            });
+
+            // Start polling
+            command_handler->start();
+            std::cout << "Telegram command handler started" << std::endl;
+        }
+
         std::cout << "Press Ctrl+C to stop" << std::endl;
 
         // For demo purposes, run indefinitely
         for (;;) {
             sleep(1);
+        }
+
+        // Stop command handler
+        if (command_handler) {
+            command_handler->stop();
         }
 
         capturer.showStats();
