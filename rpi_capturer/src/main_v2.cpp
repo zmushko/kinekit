@@ -84,14 +84,16 @@ public:
     struct MotionDetection {
         bool enabled = true;
         int frame_skip = 7;
+        float pixel_change_sensitivity = 25.0f;  // Pixel brightness difference threshold (0-255)
+        float min_object_size = 0.05f;           // Minimum object size as fraction of frame (0.0-1.0)
     } motion_detection;
 
     // MJPEG settings
     struct Mjpeg {
         bool enabled = true;
         bool output_enabled = true;
-        int encode_interval_ms = 300;
-        int burst_photo_count = 5;
+        int encode_interval_ms = 1000;
+        int burst_photo_count = 1;
         int max_burst_packets_during_recording = 3;  // Max burst packets to send while recording video
     } mjpeg;
 
@@ -119,7 +121,7 @@ public:
 
         struct Broadcast {
             bool enabled = true;
-            int port = 9999;
+            int port = 8554;
             int max_clients = 5;
         } broadcast;
 
@@ -174,6 +176,8 @@ public:
             if (motion) {
                 config.motion_detection.enabled = motion->get_as<bool>("enabled").value_or(config.motion_detection.enabled);
                 config.motion_detection.frame_skip = motion->get_as<int>("frame_skip").value_or(config.motion_detection.frame_skip);
+                config.motion_detection.pixel_change_sensitivity = motion->get_as<double>("pixel_change_sensitivity").value_or(config.motion_detection.pixel_change_sensitivity);
+                config.motion_detection.min_object_size = motion->get_as<double>("min_object_size").value_or(config.motion_detection.min_object_size);
             }
 
             // MJPEG
@@ -906,6 +910,9 @@ public:
         prev_y_frame_.resize(sample_width_ * sample_height_);
         first_frame_ = true; // Reset detection
     }
+
+    float getThreshold() const { return threshold_; }
+    float getMotionAreaThreshold() const { return motion_area_threshold_; }
 
     // Statistics methods
     float getMotionLevel() const { return last_motion_level_; }
@@ -4007,6 +4014,14 @@ public:
         }
     }
 
+    float getMotionThreshold() const {
+        return motion_detector_ ? motion_detector_->getThreshold() : 0.0f;
+    }
+
+    float getMotionAreaThreshold() const {
+        return motion_detector_ ? motion_detector_->getMotionAreaThreshold() : 0.0f;
+    }
+
     void setMotionFrameSkip(int skip) {
         motion_frame_skip_ = std::max(1, skip); // Minimum skip = 1 (process every frame)
         motion_frame_counter_ = 0; // Reset counter
@@ -4351,7 +4366,11 @@ int main(int argc, char *argv[]) {
         if (config.motion_detection.enabled) {
             capturer.enableMotionDetection(true);
             capturer.setMotionFrameSkip(config.motion_detection.frame_skip);
-            std::cout << "Motion detection enabled (frame_skip: " << config.motion_detection.frame_skip << ")" << std::endl;
+            capturer.setMotionThreshold(config.motion_detection.pixel_change_sensitivity);
+            capturer.setMotionAreaThreshold(config.motion_detection.min_object_size);
+            std::cout << "Motion detection enabled (frame_skip: " << config.motion_detection.frame_skip
+                      << ", sensitivity: " << config.motion_detection.pixel_change_sensitivity
+                      << ", min_object_size: " << (config.motion_detection.min_object_size * 100) << "%)" << std::endl;
         } else {
             capturer.enableMotionDetection(false);
             std::cout << "Motion detection disabled" << std::endl;
@@ -4403,19 +4422,70 @@ int main(int argc, char *argv[]) {
 
             // Set command callback
             command_handler->setCommandCallback([&capturer, &command_handler](const std::string& command) {
-                if (command == "/motion_on") {
+                // Parse command and arguments
+                std::istringstream iss(command);
+                std::string cmd;
+                iss >> cmd;  // First word is the command
+
+                if (cmd == "/motion_on") {
                     capturer.enableMotionDetection(true);
                     command_handler->sendResponse("✅ Motion detection enabled");
-                } else if (command == "/motion_off") {
+
+                } else if (cmd == "/motion_off") {
                     capturer.enableMotionDetection(false);
                     command_handler->sendResponse("🛑 Motion detection disabled");
-                } else if (command == "/status") {
-                    std::string status = "📊 Camera Status:\n";
+
+                } else if (cmd == "/status") {
+                    std::string status = "📊 Camera Status:\n\n";
                     status += "Motion detection: " + std::string(capturer.isMotionDetectionEnabled() ? "ON" : "OFF") + "\n";
-                    // status += "Video recording: " + std::string(capturer.isVideoRecordingActive() ? "YES" : "NO");
+                    status += "Video recording: " + std::string(capturer.isVideoRecordingActive() ? "YES" : "NO") + "\n\n";
+                    status += "Motion Settings:\n";
+                    status += "- Sensitivity: " + std::to_string((int)capturer.getMotionThreshold()) + "\n";
+                    status += "- Min object size: " + std::to_string((int)(capturer.getMotionAreaThreshold() * 100)) + "%";
                     command_handler->sendResponse(status);
+
+                } else if (cmd == "/sensitivity") {
+                    float value;
+                    if (iss >> value) {
+                        if (value >= 5.0f && value <= 100.0f) {
+                            capturer.setMotionThreshold(value);
+                            command_handler->sendResponse("✅ Pixel sensitivity set to " + std::to_string((int)value) +
+                                "\n\nLower = more sensitive\n5-15: very sensitive\n20-30: balanced\n40-100: less sensitive");
+                        } else {
+                            command_handler->sendResponse("❌ Value must be 5-100\nExample: /sensitivity 30");
+                        }
+                    } else {
+                        command_handler->sendResponse("📝 Current sensitivity: " + std::to_string((int)capturer.getMotionThreshold()) +
+                            "\n\nTo change: /sensitivity <5-100>\nExample: /sensitivity 30");
+                    }
+
+                } else if (cmd == "/min_size") {
+                    float value;
+                    if (iss >> value) {
+                        if (value >= 0.5f && value <= 50.0f) {
+                            capturer.setMotionAreaThreshold(value / 100.0f);
+                            command_handler->sendResponse("✅ Min object size set to " + std::to_string((int)value) + "%" +
+                                "\n\n1% = small (cat, bird)\n5% = medium (person)\n10% = large (car)");
+                        } else {
+                            command_handler->sendResponse("❌ Value must be 0.5-50 (%)\nExample: /min_size 5");
+                        }
+                    } else {
+                        command_handler->sendResponse("📝 Current min size: " + std::to_string((int)(capturer.getMotionAreaThreshold() * 100)) + "%" +
+                            "\n\nTo change: /min_size <0.5-50>\nExample: /min_size 5");
+                    }
+
+                } else if (cmd == "/help") {
+                    std::string help = "🤖 Available Commands:\n\n";
+                    help += "/motion_on - Enable motion detection\n";
+                    help += "/motion_off - Disable motion detection\n";
+                    help += "/status - Show camera status\n";
+                    help += "/sensitivity <5-100> - Pixel change sensitivity\n";
+                    help += "/min_size <0.5-50> - Min object size (%)\n";
+                    help += "/help - Show this message";
+                    command_handler->sendResponse(help);
+
                 } else {
-                    command_handler->sendResponse("❓ Unknown command. Available: /motion_on, /motion_off, /status");
+                    command_handler->sendResponse("❓ Unknown command. Type /help for available commands.");
                 }
             });
 

@@ -1,63 +1,240 @@
+# =============================================================================
 # RPI Capturer Configuration
+# =============================================================================
 
+# -----------------------------------------------------------------------------
+# Camera Settings
+# -----------------------------------------------------------------------------
 [camera]
-width = 1920                    # Resolution width
-height = 1080                   # Resolution height
-fps = 30                        # Frames per second
 
+# Camera resolution width in pixels
+# Default: 1920
+#width = 1920
+
+# Camera resolution height in pixels
+# Default: 1080
+#height = 1080
+
+# Frames per second
+# Default: 30
+#fps = 30
+
+# -----------------------------------------------------------------------------
+# Autofocus Settings (Camera Module v3 only)
+# -----------------------------------------------------------------------------
 [autofocus]
-enabled = true                  # Enable autofocus (Camera Module v3 only)
-mode = 2                        # 0=Auto, 1=Manual, 2=Continuous
-speed = 1                       # 0=Normal, 1=Fast
-range = 2                       # 0=Normal, 1=Macro, 2=Full
 
+# Enable autofocus
+# Default: true
+#enabled = true
+
+# Autofocus mode: 0=Auto, 1=Manual, 2=Continuous
+# Default: 2
+#mode = 2
+
+# Autofocus speed: 0=Normal, 1=Fast
+# Default: 1
+#speed = 1
+
+# Autofocus range: 0=Normal, 1=Macro, 2=Full
+# Default: 2
+#range = 2
+
+# -----------------------------------------------------------------------------
+# Motion Detection
+# -----------------------------------------------------------------------------
 [motion_detection]
-enabled = true                  # Enable motion detection
-frame_skip = 7                  # Frames to skip between checks (reduces CPU load)
 
+# Enable motion detection
+# Default: true
+#enabled = true
+
+# Frames to skip between motion checks (reduces CPU load)
+# Higher values = less CPU usage but slower detection
+# Default: 7
+#frame_skip = 7
+
+# Pixel brightness change sensitivity (0-255)
+# How much a pixel must change to be considered "motion"
+# Lower values (10-15) = very sensitive, detects shadows/lighting changes
+# Medium values (20-30) = balanced, normal motion detection
+# Higher values (40-50) = less sensitive, only obvious changes
+# Default: 25.0
+#pixel_change_sensitivity = 25.0
+
+# Minimum object size as percentage of frame (0.0-1.0)
+# What fraction of the frame must change to trigger motion detection
+# 0.01 = 1%  - detects small objects (cat, bird, hand)
+# 0.05 = 5%  - detects medium objects (person, dog)
+# 0.10 = 10% - detects large objects (car, multiple people)
+# Default: 0.05
+#min_object_size = 0.05
+
+# -----------------------------------------------------------------------------
+# MJPEG / JPEG Settings
+# -----------------------------------------------------------------------------
 [mjpeg]
-enabled = true                  # Enable MJPEG encoder
-output_enabled = true           # Save/send MJPEG frames
-encode_interval_ms = 1000       # Milliseconds between adding photos to burst buffer
-burst_photo_count = 1           # Number of photos collect in batch before sending
-max_burst_packets_during_recording = 3  # Max burst packets to send while recording video
 
+# Enable MJPEG encoder
+# Default: true
+#enabled = true
+
+# Enable MJPEG output (save/send frames)
+# Default: true
+#output_enabled = true
+
+# Minimum milliseconds between adding photos to burst buffer
+# Controls frequency of burst photo collection
+# Default: 1000
+#encode_interval_ms = 1000
+
+# Number of photos to collect before sending to Telegram as media group
+# 1 = send individually (not recommended)
+# Default: 1
+#burst_photo_count = 1
+
+# Maximum burst packets to send while video is being recorded
+# Prevents flooding Telegram with photos during video recording
+# 0 = disable burst photos during recording
+# Default: 3
+#max_burst_packets_during_recording = 3
+
+# -----------------------------------------------------------------------------
+# H.264 Video Encoding
+# -----------------------------------------------------------------------------
 [h264]
-enabled = true                  # Enable H.264 video encoder
-output_enabled = true           # Save/send H.264 video
-gop_size = 60                   # Frames between keyframes
-bitrate = 5000000               # Bits per second (5Mbps)
-cbr = false                     # Use constant bitrate (false = VBR)
-sps_pps_repeat = true           # Repeat headers for streaming compatibility
 
+# Enable H.264 hardware encoder
+# Default: true
+#enabled = true
+
+# Enable H.264 output (save/send video)
+# Default: true
+#output_enabled = true
+
+# GOP (Group of Pictures) size - frames between keyframes
+# Lower = better seek/quality, higher = better compression
+# Default: 60
+#gop_size = 60
+
+# Video bitrate in bits per second
+# Default: 5000000 (5 Mbps)
+#bitrate = 5000000
+
+# Use constant bitrate (true) or variable bitrate (false)
+# Default: false
+#cbr = false
+
+# Repeat SPS/PPS headers for streaming compatibility
+# Default: true
+#sps_pps_repeat = true
+
+# -----------------------------------------------------------------------------
+# Telegram Bot Integration
+# -----------------------------------------------------------------------------
 [telegram]
-enabled = true                  # Enable Telegram bot
+
+# Enable Telegram bot for notifications and control
+# Default: true
+#enabled = true
+
+# Telegram bot token (get from @BotFather)
+# REQUIRED: Replace with your actual bot token
 bot_token = "YOUR_BOT_TOKEN_HERE"
+
+# Telegram chat ID (your user ID or group chat ID)
+# REQUIRED: Replace with your actual chat ID
 chat_id = "YOUR_CHAT_ID_HERE"
-max_queue_size = 5              # Maximum pending messages
 
+# Maximum pending messages in queue
+# Default: 5
+#max_queue_size = 5
+
+# -----------------------------------------------------------------------------
+# TCP Streaming
+# -----------------------------------------------------------------------------
 [tcp]
-format = "h264"                 # Stream format: "h264" or "mjpeg"
 
+# Stream format for TCP
+# Options: "h264" or "mjpeg"
+# Default: "h264"
+#format = "h264"
+
+# TCP Broadcast Server (act as streaming server)
 [tcp.broadcast]
-enabled = true                  # Act as TCP server
-port = 8554                     # Listen port
-max_clients = 5                 # Maximum simultaneous connections
 
+# Enable TCP broadcast server
+# Default: true
+#enabled = true
+
+# TCP listening port
+# Default: 8554
+#port = 8554
+
+# Maximum simultaneous client connections
+# Default: 5
+#max_clients = 5
+
+# TCP Client (connect to remote server)
 [tcp.client]
-enabled = false                 # Connect to remote server
-remote_ip = "10.0.0.2"
-remote_port = 9999
-reconnect_interval_sec = 1      # Retry interval on disconnect
 
+# Enable TCP client mode
+# Default: false
+#enabled = false
+
+# Remote server IP address
+# Default: "10.0.0.2"
+#remote_ip = "10.0.0.2"
+
+# Remote server port
+# Default: 9999
+#remote_port = 9999
+
+# Reconnection interval in seconds on disconnect
+# Default: 1
+#reconnect_interval_sec = 1
+
+# -----------------------------------------------------------------------------
+# Video Recording to File
+# -----------------------------------------------------------------------------
 [video_recording]
-enabled = true                  # Enable video recording
-duration_sec = 30               # Video file duration
-preroll_sec = 3                 # Buffer before motion detected
-tail_duration = 5               # Seconds to record after motion stops
-max_memory_mb = 20              # Memory buffer size
-failed_videos_dir = "/home/pi/recordings/failed"
-max_failed_files = 50           # Keep last N failed uploads
-# retry_interval_sec = 2          # Retry delay for failed uploads
-# max_retries = 2                 # Upload retry attempts
-# send_to_telegram = true         # Upload videos to Telegram
+
+# Enable video recording on motion detection
+# Default: true
+#enabled = true
+
+# Maximum video file duration in seconds
+# Default: 30
+#duration_sec = 30
+
+# Preroll buffer duration in seconds (recorded before motion detected)
+# Default: 3
+#preroll_sec = 3
+
+# Tail duration - seconds to record after motion stops
+# Default: 5
+#tail_duration = 5
+
+# Maximum memory buffer size in megabytes
+# Default: 20
+#max_memory_mb = 20
+
+# Directory for failed video uploads (uses tmpfs for SD card longevity)
+# Default: "/home/pi/recordings/failed"
+#failed_videos_dir = "/home/pi/recordings/failed"
+
+# Maximum number of failed upload files to keep
+# Default: 50
+#max_failed_files = 50
+
+# Retry delay for failed uploads in seconds
+# Default: 2
+#retry_interval_sec = 2
+
+# Maximum upload retry attempts
+# Default: 2
+#max_retries = 2
+
+# Upload recorded videos to Telegram
+# Default: true
+#send_to_telegram = true
