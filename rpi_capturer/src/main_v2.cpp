@@ -39,6 +39,9 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
+// ALSA for audio capture
+#include <alsa/asoundlib.h>
+
 // ARM NEON intrinsics for SIMD optimization
 #ifdef __ARM_NEON
 #include <arm_neon.h>
