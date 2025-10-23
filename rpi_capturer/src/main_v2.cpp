@@ -3634,7 +3634,9 @@ public:
             std::cerr << "Failed to create configuration" << std::endl;
             return false;
         }
-        
+
+        config_->orientation = Orientation::Rotate180;
+
         // Configure parameters for Zero 2W + Camera v3
         StreamConfiguration &stream_config = config_->at(0);
         stream_config.size = Size(width_, height_);  // Use configured resolution
