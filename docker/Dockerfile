@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         meson \
         ninja-build \
         pkg-config \
+        libtomlplusplus-dev \
+        libspdlog-dev \
         libcamera-dev \
         libavformat-dev \
         libavcodec-dev \
