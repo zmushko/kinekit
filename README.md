@@ -1,37 +1,37 @@
 # kinekit
 
-Модульный набор инструментов для умных Raspberry Pi камер. Общий корень — *kine-* (греч. движение).
+A modular toolkit for smart Raspberry Pi cameras. Common root: *kine-* (Greek for "motion").
 
-## Компоненты
+## Components
 
 ```
 kinekit/
-├── kinecore/    общая C++ библиотека
-├── kinegram/    приложение: наблюдение + Telegram
-└── kinemetry/   приложение: научный сбор кинематики
+├── kinecore/    shared C++ library
+├── kinegram/    application: observation + Telegram
+└── kinemetry/   application: scientific motion-data collection
 ```
 
 ### kinecore
-C++ библиотека-фундамент. Захват с камеры через `libcamera`, детекция движения, кодирование H.264 и MJPEG, муксирование MP4 через `libav`, транспорт (файлы, TCP, Telegram), конфигурация в TOML. Используется обоими приложениями.
+The foundation C++ library. Camera capture via `libcamera`, motion detection, H.264 and MJPEG encoding, MP4 muxing via `libav`, transports (files, TCP, Telegram), and TOML-based configuration. Consumed by both applications.
 
 ### kinegram
-Автономное наблюдение с детекцией движения и публикацией событий, фото и видео в Telegram. Двусторонний канал управления через Telegram-бот (вкл./выкл. детекции, регулировка чувствительности, размер минимального объекта и т.д.). Витринный продукт.
+Standalone surveillance app: motion-triggered capture with events, photos, and videos published to Telegram. Two-way control via a Telegram bot (toggle detection, tune sensitivity, set minimum object size, etc.). The showcase product.
 
 ### kinemetry
-Сбор кинематических данных на тонком клиенте: количество объектов в кадре, паттерны движения, вектора, скорости, ускорения. Цифровые данные сохраняются в формате, удобном для последующего анализа большими языковыми моделями или человеком-оператором. Возможные применения — биология, этология, мониторинг популяций.
+Kinematic data collection on a thin client: object counts, motion patterns, vectors, velocities, accelerations. Captured data is stored in formats suitable for downstream analysis by large language models or a human operator. Potential applications include biology, ethology, and population monitoring.
 
-## Статус
+## Status
 
-Ранняя стадия. Проект вырастает из экспериментов в `rpi_capturer/src/main_v2.cpp` (~4500 строк, монолит), который сейчас работает на боевой Pi Zero. Следующий шаг — постепенный распил монолита на `kinecore` + два приложения.
+Early stage. The project is being carved out of experiments in `rpi_capturer/src/main_v2.cpp` (~4500-line monolith) that currently runs on a live Raspberry Pi Zero. Next step: incremental extraction of the monolith into `kinecore` + the two applications.
 
-## Платформа
+## Platform
 
-Raspberry Pi (Pi Zero подтверждён, ожидается совместимость с Pi 4 / Pi 5 и другими модулями с поддержкой `libcamera`). ARM Linux. Сборка через CMake.
+Raspberry Pi (Pi Zero confirmed; Pi 4 / Pi 5 and other modules with `libcamera` support expected to work). ARM Linux. Built with CMake.
 
-## Соавторство
+## Co-authorship
 
-Проект разрабатывается совместно с [Claude](https://www.anthropic.com/claude) от Anthropic. Архитектурные решения, выбор имён, рефакторинг — всё в диалоге между автором-человеком и моделью.
+Developed jointly with [Claude](https://www.anthropic.com/claude) by Anthropic. Architecture, naming, and refactoring decisions are made in dialogue between the human author and the model.
 
-## Лицензия
+## License
 
 TBD.
