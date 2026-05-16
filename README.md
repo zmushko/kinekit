@@ -49,6 +49,23 @@ PLATFORM=linux/amd64  docker/build.sh    # x86_64 for local testing
 
 Artefacts land in `./out/<platform>/` on the host.
 
+### Makefile shortcuts
+
+A top-level `Makefile` wraps the common loops: build, deploy to a Pi over SSH,
+run a smoke test, and so on. Defaults target `pi@zero.local`; override via
+environment.
+
+```sh
+make help          # list all targets
+make ssh-key       # install local SSH public key on the Pi (one-time)
+make build         # cross-build for linux/arm64
+make deploy        # build then scp artefacts to pi@zero.local
+make test          # deploy and verify kinegram runs on the Pi
+make run           # just run kinegram on the Pi
+make ssh           # interactive shell on the Pi
+make clean         # wipe ./out
+```
+
 ## Co-authorship
 
 Developed jointly with [Claude](https://www.anthropic.com/claude) by Anthropic.
