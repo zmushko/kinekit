@@ -1,6 +1,6 @@
 # kinekit
 
-A modular toolkit for smart Raspberry Pi cameras. Common root: *kine-* (Greek for "motion").
+A modular toolkit for smart Raspberry Pi cameras. Common root: *kine-* (kinesis Greek for "motion").
 
 ## Components
 
@@ -22,15 +22,21 @@ Kinematic data collection on a thin client: object counts, motion patterns, vect
 
 ## Status
 
-Early stage. The project is being carved out of experiments in `rpi_capturer/src/main_v2.cpp` (~4500-line monolith) that currently runs on a live Raspberry Pi Zero. Next step: incremental extraction of the monolith into `kinecore` + the two applications.
+Early stage. The project is being carved out of experiments in `main.cpp` (~4500-line monolith) that currently runs on a live Raspberry Pi Zero. Next step: incremental extraction of the monolith into `kinecore` + the two applications.
 
 ## Platform
 
-Raspberry Pi (Pi Zero confirmed; Pi 4 / Pi 5 and other modules with `libcamera` support expected to work). ARM Linux. Built with CMake.
+Raspberry Pi (Pi Zero confirmed; Pi 4 / Pi 5 and other modules with `libcamera` support expected to work). ARM Linux. Built with [Meson](https://mesonbuild.com/) + [Ninja](https://ninja-build.org/).
+
+```sh
+meson setup build
+ninja -C build
+./build/kinegram/kinegram   # or kinemetry/kinemetry
+```
 
 ## Co-authorship
 
-Developed jointly with [Claude](https://www.anthropic.com/claude) by Anthropic. Architecture, naming, and refactoring decisions are made in dialogue between the human author and the model.
+Developed jointly with [Claude](https://www.anthropic.com/claude) by Anthropic.
 
 ## License
 
