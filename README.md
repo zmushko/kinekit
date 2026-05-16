@@ -34,6 +34,21 @@ ninja -C build
 ./build/kinegram/kinegram   # or kinemetry/kinemetry
 ```
 
+### Cross-platform builds via Docker
+
+Reproducible builds for any Raspberry Pi target are driven by `docker/build.sh`,
+which wraps `docker buildx`. The same `docker/Dockerfile` (Debian Trixie base)
+produces binaries for any architecture the host can run — natively on Apple
+Silicon for `linux/arm64`, via QEMU emulation on x86_64 hosts.
+
+```sh
+docker/build.sh                          # default: linux/arm64 (Pi Zero 2 W, Pi 4, Pi 5)
+PLATFORM=linux/arm/v7 docker/build.sh    # 32-bit ARMv7
+PLATFORM=linux/amd64  docker/build.sh    # x86_64 for local testing
+```
+
+Artefacts land in `./out/<platform>/` on the host.
+
 ## Co-authorship
 
 Developed jointly with [Claude](https://www.anthropic.com/claude) by Anthropic.

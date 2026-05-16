@@ -1,0 +1,10 @@
+.git
+.gitignore
+build/
+build*/
+out/
+docker/
+*.md
+.DS_Store
+.vscode/
+.idea/
