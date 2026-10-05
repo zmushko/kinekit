@@ -1,0 +1,16 @@
+https://archive.raspberrypi.com/debian/pool/main/g/glibc/libc6_2.41-12+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/g/glibc/libc-bin_2.41-12+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/g/glibc/libc-dev-bin_2.41-12+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/g/glibc/libc6-dev_2.41-12+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/l/linux/linux-libc-dev_6.12.47-1+rpt1_all.deb
+https://archive.raspberrypi.com/debian/pool/main/f/ffmpeg/libavutil59_7.1.1-1~+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/f/ffmpeg/libavutil-dev_7.1.1-1~+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/f/ffmpeg/libswresample5_7.1.1-1~+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/f/ffmpeg/libswresample-dev_7.1.1-1~+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/f/ffmpeg/libavcodec61_7.1.1-1~+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/f/ffmpeg/libavcodec-dev_7.1.1-1~+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/f/ffmpeg/libavformat61_7.1.1-1~+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/f/ffmpeg/libavformat-dev_7.1.1-1~+rpt1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/libc/libcamera/libcamera-ipa_0.5.2+rpt20250903-1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/libc/libcamera/libcamera0.5_0.5.2+rpt20250903-1_arm64.deb
+https://archive.raspberrypi.com/debian/pool/main/libc/libcamera/libcamera-dev_0.5.2+rpt20250903-1_arm64.deb
